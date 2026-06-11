@@ -946,7 +946,15 @@ func mergeDuplicateHostnames() {
 		}
 
 		db.Exec("UPDATE devices SET ipv4=CASE WHEN ipv4='' THEN ? ELSE ipv4 END WHERE id=?", ip2, keepID)
+		// Move all data from rm to keep
 		db.Exec("UPDATE device_macs SET device_id=? WHERE device_id=?", keepID, rmID)
+		// Update keep with rm's IP and MAC if keep doesn't have them
+		db.Exec("UPDATE devices SET ipv4=CASE WHEN ipv4='' THEN ? ELSE ipv4 END WHERE id=?", ip2, keepID)
+		if isRandomMAC(mac2) && !isRandomMAC(mac1) {
+			db.Exec("INSERT OR IGNORE INTO device_macs (device_id,mac,first_seen,last_seen) VALUES (?,'?',?,?)", keepID, mac2, time.Now().Unix(), time.Now().Unix())
+		} else if isRandomMAC(mac1) && !isRandomMAC(mac2) {
+			db.Exec("INSERT OR IGNORE INTO device_macs (device_id,mac,first_seen,last_seen) VALUES (?,?,?,?)", keepID, mac1, time.Now().Unix(), time.Now().Unix())
+		}
 		db.Exec("DELETE FROM devices WHERE id=?", rmID)
 		log.Printf("Fingerprint-merged %s: %d → %d", hostname, rmID, keepID)
 	}
