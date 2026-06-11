@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -29,72 +30,58 @@ type DeviceProfile struct {
 	IsBlocked  bool   `json:"is_blocked"`
 	RateLimit  int    `json:"rate_limit"`
 	LastSeen   int64  `json:"last_seen"`
-	Online     string `json:"online"` // green/yellow/gray
+	Online     string `json:"online"`
 	SpeedOut   uint64 `json:"speed_out"`
-	NumMACs    int    `json:"num_macs"` // historical MAC count
+	NumMACs    int    `json:"num_macs"`
 }
 
-type Config struct{ WANIF, LANIF, DBPath, DHCPHookPath string }
-
 var (
-	db     *sql.DB
-	config Config
-	mu     sync.RWMutex
+	db        *sql.DB
+	mu        sync.RWMutex
+	prevBytes = map[string]uint64{}
+	firstSeen = map[string]bool{}
+	speedMu   sync.Mutex
+	scriptDir = "/usr/lib/devman"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags)
-	config = Config{
-		WANIF:        getEnv("WAN_IF", "eth0"),
-		LANIF:        getEnv("LAN_IF", "br-lan"),
-		DBPath:       getEnv("DB_PATH", "/etc/devman/devman.db"),
-		DHCPHookPath: getEnv("DHCP_HOOK", "/usr/lib/devman/dhcp-hook.sh"),
-	}
 	os.MkdirAll("/etc/devman", 0755)
-	fmt.Println("devman v2 starting...")
+	os.MkdirAll(scriptDir, 0755)
 
 	var err error
-	db, err = sql.Open("sqlite", config.DBPath)
+	db, err = sql.Open("sqlite", "/etc/devman/devman.db")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 	initDB()
-	// installDHCPHook() // skip for now, test router doesn't have dnsmasq.conf writable
 
-	// Startup: broadcast ping to fill ARP table
-	broadcastPing()
+	installScripts()
+	initTC()
+	initNFT()
 
-	// Recover rules
-	recoverRules()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go deviceWatcher(&wg)
-	wg.Add(1)
-	go speedCollector(&wg)
-	wg.Add(1)
-	go ruleLoop(&wg)
+	go neightLoop()
+	go conntrackLoop()
+	go leaseLoop()
+	go speedLoop()
+	go reconcileLoop()
 
 	http.HandleFunc("/api/devices", apiDevices)
 	http.HandleFunc("/api/block", apiBlock)
 	http.HandleFunc("/api/limit", apiLimit)
 	http.HandleFunc("/api/dhcp-event", apiDHCPEvent)
-	http.HandleFunc("/api/merge", apiMerge)
-	http.HandleFunc("/api/device/", apiDelete)
 	go http.ListenAndServe(":9999", nil)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	// cleanup
+	exec.Command(scriptDir+"/block.sh", "init").Run()
+	exec.Command(scriptDir+"/limit.sh", "clean").Run()
 }
 
-func getEnv(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return d
-}
+// ======== init ========
 
 func initDB() {
 	for _, q := range []string{
@@ -105,18 +92,13 @@ func initDB() {
 			device_type TEXT DEFAULT 'Unknown',
 			alias TEXT DEFAULT '', ipv4 TEXT DEFAULT '',
 			is_blocked INTEGER DEFAULT 0, rate_limit INTEGER DEFAULT 0,
-			first_seen INTEGER DEFAULT 0, last_seen INTEGER DEFAULT 0,
-			online_status TEXT DEFAULT 'gray'
+			last_seen INTEGER DEFAULT 0, first_seen INTEGER DEFAULT 0
 		)`,
-		`ALTER TABLE devices ADD COLUMN online_status TEXT DEFAULT 'gray'`,
-
 		`CREATE TABLE IF NOT EXISTS device_macs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			device_id INTEGER NOT NULL, mac TEXT NOT NULL,
 			first_seen INTEGER DEFAULT 0, last_seen INTEGER DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS traffic (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			device_id INTEGER NOT NULL, speed_out INTEGER DEFAULT 0,
 			recorded_at INTEGER DEFAULT 0
 		)`,
@@ -125,126 +107,112 @@ func initDB() {
 	}
 }
 
-func broadcastPing() {
-	// Get LAN subnet from interface
-	out, _ := exec.Command("sh", "-c", fmt.Sprintf("ip -4 addr show %s | grep 'inet ' | awk '{print $2}'", config.LANIF)).Output()
-	cidr := strings.TrimSpace(string(out))
-	if cidr == "" {
-		return
-	}
-	// ping broadcast address
-	bcast := cidrToBroadcast(cidr)
-	if bcast != "" {
-		exec.Command("ping", "-b", "-c", "1", "-W", "1", bcast).Run()
-	}
-}
-
-func cidrToBroadcast(cidr string) string {
-	var ip [4]int
-	var mask int
-	fmt.Sscanf(cidr, "%d.%d.%d.%d/%d", &ip[0], &ip[1], &ip[2], &ip[3], &mask)
-	if mask == 0 {
-		return ""
-	}
-	for i := mask; i < 32; i++ {
-		ip[i/8] |= 1 << (7 - uint(i%8))
-	}
-	return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
-}
-
-func installDHCPHook() {
-	hookDir := "/usr/lib/devman"
-	os.MkdirAll(hookDir, 0755)
-	script := `#!/bin/sh
-# dnsmasq dhcp-script hook for devman
+func installScripts() {
+	scripts := map[string]string{
+		"block.sh": `#!/bin/sh
+# nftables set-based blocking
+case "$1" in
+  init)
+    nft add table ip devman 2>/dev/null
+    nft add set ip devman blocked_ip { type ipv4_addr\; } 2>/dev/null
+    nft add chain ip devman forward { type filter hook forward priority filter - 1\; } 2>/dev/null
+    nft add rule ip devman forward ip saddr @blocked_ip drop 2>/dev/null
+    ;;
+  add) nft add element ip devman blocked_ip { $2 } 2>/dev/null ;;
+  del) nft delete element ip devman blocked_ip { $2 } 2>/dev/null ;;
+esac`,
+		"limit.sh": `#!/bin/sh
+# tc htb rate limiting, uses device_id as classid
+CID=$2; IP=$3; RATE=${4:-0}; IF=br-lan
+case "$1" in
+  init) tc qdisc add dev $IF root handle 1: htb default 30 2>/dev/null ;;
+  set)
+    tc filter del dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID 2>/dev/null
+    tc class del dev $IF parent 1: classid 1:$CID 2>/dev/null
+    tc class add dev $IF parent 1: classid 1:$CID htb rate ${RATE}kbit ceil ${RATE}kbit 2>/dev/null
+    tc filter add dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID 2>/dev/null
+    ;;
+  del)
+    tc filter del dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID 2>/dev/null
+    tc class del dev $IF parent 1: classid 1:$CID 2>/dev/null
+    ;;
+  clean)
+    tc qdisc del dev $IF root 2>/dev/null
+    tc qdisc add dev $IF root handle 1: htb default 30 2>/dev/null
+    ;;
+esac`,
+		"dhcp-hook.sh": `#!/bin/sh
 [ "$1" = "add" ] || [ "$1" = "old" ] || exit 0
-MAC=$2 IP=$3
 curl -s -X POST http://127.0.0.1:9999/api/dhcp-event -H "Content-Type: application/json" \
-  -d "{\"mac\":\"$MAC\",\"ip\":\"$IP\",\"hostname\":\"${DNSMASQ_SUPPLIED_HOSTNAME:-}\",\"vendor_class\":\"${DNSMASQ_VENDOR_CLASS:-}\",\"opt55\":\"${DNSMASQ_REQUESTED_OPTIONS:-}\"}" &
-`
-	os.WriteFile(config.DHCPHookPath, []byte(script), 0755)
-
-	// Add to dnsmasq config if not present
-	data, _ := os.ReadFile("/etc/dnsmasq.conf")
-	if !strings.Contains(string(data), "dhcp-script="+config.DHCPHookPath) {
+  -d "{\"mac\":\"$2\",\"ip\":\"$3\",\"hostname\":\"${DNSMASQ_SUPPLIED_HOSTNAME:-}\",\"vendor_class\":\"${DNSMASQ_VENDOR_CLASS:-}\",\"opt55\":\"${DNSMASQ_REQUESTED_OPTIONS:-}\"}" &`,
+	}
+	for name, content := range scripts {
+		os.WriteFile(scriptDir+"/"+name, []byte(content), 0755)
+	}
+	// Ensure dnsmasq hook
+	hook := scriptDir + "/dhcp-hook.sh"
+	cfg, _ := os.ReadFile("/etc/dnsmasq.conf")
+	if !strings.Contains(string(cfg), "dhcp-script="+hook) {
 		f, _ := os.OpenFile("/etc/dnsmasq.conf", os.O_APPEND|os.O_WRONLY, 0644)
 		if f != nil {
-			f.WriteString("\ndhcp-script=" + config.DHCPHookPath + "\ndhcp-authoritative\n")
+			f.WriteString("\ndhcp-script=" + hook + "\ndhcp-authoritative\n")
 			f.Close()
-			exec.Command("/etc/init.d/dnsmasq", "restart").Run()
 		}
 	}
 }
 
-// ======== device discovery ========
+func initTC()  { exec.Command(scriptDir+"/limit.sh", "init").Run() }
+func initNFT() { exec.Command(scriptDir+"/block.sh", "init").Run() }
 
-func deviceWatcher(wg *sync.WaitGroup) {
-	defer wg.Done()
-	scanARP()
-	go conntrackWatcher()
-	go leaseWatcher()
-}
+// ======== discovery ========
 
-func scanARP() {
-	// ip neigh show (format: IP dev IF lladdr MAC STATE)
-	out, _ := exec.Command("sh", "-c", "ip neigh show | grep REACHABLE").Output()
-	fmt.Println("ARP scan: found", len(strings.Split(string(out), "\n"))-1, "REACHABLE entries")
-	for _, line := range strings.Split(string(out), "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 5 {
-			upsertDevice(f[0], f[4], "", "", "", "")
-			fmt.Println("ARP added:", f[0], f[4])
-		}
-	}
-	// /proc/net/arp
-	out2, _ := exec.Command("cat", "/proc/net/arp").Output()
-	for _, line := range strings.Split(string(out2), "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 4 && isLAN(f[0]) && f[0] != "127.0.0.1" && f[2] == "0x2" {
-			upsertDevice(f[0], f[3], "", "", "", "")
-		}
-	}
-}
-
-func conntrackWatcher() {
-	cmd := exec.Command("conntrack", "-E")
-	stdout, _ := cmd.StdoutPipe()
-	cmd.Start()
-	defer func() {
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-	}()
-
-	var ip, dst string
-	buf := make([]byte, 8192)
+func neightLoop() {
 	for {
-		n, err := stdout.Read(buf)
-		if n == 0 && err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		for _, line := range strings.Split(string(buf[:n]), "\n") {
-			if strings.Contains(line, "src=") {
-				ip = fieldVal(line, "src=")
+		out, _ := exec.Command("sh", "-c", "ip neigh show | grep REACHABLE").Output()
+		for _, line := range strings.Split(string(out), "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 5 {
+				upsertDevice(f[0], f[4], "", "", "")
 			}
-			if strings.Contains(line, "dst=") && strings.Contains(line, "bytes=") {
-				dst = fieldVal(line, "dst=")
-				if ip != "" && dst != "" && isLAN(ip) && !isLAN(dst) {
-					upsertDevice(ip, "", "", "", "", "")
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func conntrackLoop() {
+	for {
+		cmd := exec.Command("conntrack", "-E")
+		stdout, _ := cmd.StdoutPipe()
+		cmd.Start()
+		buf := make([]byte, 8192)
+		var ip, dst string
+		for {
+			n, err := stdout.Read(buf)
+			if n == 0 && err != nil {
+				break
+			}
+			for _, line := range strings.Split(string(buf[:n]), "\n") {
+				if strings.Contains(line, "src=") {
+					ip = field(line, "src=")
 				}
-				ip = ""
-				dst = ""
+				if strings.Contains(line, "dst=") && strings.Contains(line, "bytes=") {
+					dst = field(line, "dst=")
+					if ip != "" && dst != "" && isLAN(ip) && !isLAN(dst) {
+						upsertDevice(ip, "", "", "", "")
+					}
+					ip, dst = "", ""
+				}
 			}
 		}
+		cmd.Process.Kill()
+		time.Sleep(time.Second)
 	}
 }
 
-func leaseWatcher() {
+func leaseLoop() {
 	for {
-		time.Sleep(10 * time.Second)
-		mu.Lock()
 		out, _ := exec.Command("sh", "-c", "cat /tmp/hosts/dhcp.* /tmp/hosts/odhcpd.hosts.lan 2>/dev/null | grep -v '^#'").Output()
+		mu.Lock()
 		for _, line := range strings.Split(string(out), "\n") {
 			f := strings.Fields(line)
 			if len(f) >= 2 && isLAN(f[0]) && f[1] != "" {
@@ -252,90 +220,73 @@ func leaseWatcher() {
 			}
 		}
 		mu.Unlock()
+		time.Sleep(10 * time.Second)
 	}
 }
 
-// ======== 3-tier matching ========
+// ======== matching ========
 
-func upsertDevice(ip, mac, hostname, vendorClass, opt55, devType string) {
+func upsertDevice(ip, mac, hostname, vendorClass, opt55 string) int64 {
 	mu.Lock()
 	defer mu.Unlock()
 	now := time.Now().Unix()
 
-	// Get MAC from ARP if not provided (works for IPv4 and IPv6 via ip neigh)
-	if mac == "" {
-		mac = getMACviaIPNeigh(ip)
+	if mac == "" && !strings.Contains(ip, ":") {
+		mac = getMAC(ip)
 	}
-	// Get hostname from DHCP if not provided
+	fpHash := hashOpt55(opt55)
 	if hostname == "" {
 		hostname = getHostname(ip)
 	}
+	devType := detectType(hostname, vendorClass)
 
-	// Tier 1: MAC match
+	// Tier 1: MAC
 	if mac != "" {
 		var id int64
 		if db.QueryRow("SELECT id FROM devices WHERE mac=?", mac).Scan(&id) == nil {
-			updateDevice(id, ip, mac, hostname, now)
-			db.Exec("INSERT OR IGNORE INTO device_macs (device_id, mac, first_seen, last_seen) VALUES (?,?,?,?)", id, mac, now, now)
-			return
+			updateDev(id, ip, mac, hostname, vendorClass, fpHash, now)
+			return id
 		}
-		// Check device_macs for historical MAC
 		if db.QueryRow("SELECT device_id FROM device_macs WHERE mac=? LIMIT 1", mac).Scan(&id) == nil {
-			updateDevice(id, ip, mac, hostname, now)
-			db.Exec("UPDATE device_macs SET last_seen=? WHERE mac=?", now, mac)
-			return
+			updateDev(id, ip, mac, hostname, vendorClass, fpHash, now)
+			return id
 		}
 	}
 
-	// Tier 2: Hostname match
+	// Tier 2: Hostname
 	if hostname != "" {
 		var id int64
 		if db.QueryRow("SELECT id FROM devices WHERE hostname=? LIMIT 1", hostname).Scan(&id) == nil {
-			updateDevice(id, ip, mac, hostname, now)
-			if mac != "" {
-				db.Exec("INSERT OR IGNORE INTO device_macs (device_id, mac, first_seen, last_seen) VALUES (?,?,?,?)", id, mac, now, now)
-			}
-			return
+			updateDev(id, ip, mac, hostname, vendorClass, fpHash, now)
+			return id
 		}
 	}
 
-	// Tier 3: DHCP fingerprint match
+	// Tier 3: DHCP fingerprint
 	if vendorClass != "" && opt55 != "" {
-		fpHash := hashOpt55(opt55)
 		var id int64
 		if db.QueryRow("SELECT id FROM devices WHERE vendor_class=? AND opt55_hash=?", vendorClass, fpHash).Scan(&id) == nil {
-			updateDevice(id, ip, mac, hostname, now)
-			if mac != "" {
-				db.Exec("INSERT OR IGNORE INTO device_macs (device_id, mac, first_seen, last_seen) VALUES (?,?,?,?)", id, mac, now, now)
-			}
-			return
-		}
-	}
-
-	// Update by IPv4
-	if !strings.Contains(ip, ":") && ip != "" {
-		var id int64
-		if db.QueryRow("SELECT id FROM devices WHERE ipv4=?", ip).Scan(&id) == nil {
-			updateDevice(id, ip, mac, hostname, now)
-			return
+			updateDev(id, ip, mac, hostname, vendorClass, fpHash, now)
+			return id
 		}
 	}
 
 	// New device
-	if devType == "" {
-		devType = detectDeviceType(hostname, vendorClass)
+	ipv4 := ""
+	if !strings.Contains(ip, ":") {
+		ipv4 = ip
 	}
-	fpHash := hashOpt55(opt55)
-	db.Exec("INSERT INTO devices (mac, hostname, vendor_class, opt55_hash, device_type, ipv4, first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?)",
-		mac, hostname, vendorClass, fpHash, devType, ipOr(ip), now, now)
+	r, _ := db.Exec("INSERT INTO devices (mac,hostname,vendor_class,opt55_hash,device_type,ipv4,first_seen,last_seen) VALUES (?,?,?,?,?,?,?,?)",
+		mac, hostname, vendorClass, fpHash, devType, ipv4, now, now)
+	id, _ := r.LastInsertId()
 	if mac != "" {
-		result, _ := db.Exec("INSERT OR IGNORE INTO device_macs (device_id, mac, first_seen, last_seen) VALUES ((SELECT id FROM devices WHERE mac=? LIMIT 1),?,?,?)", mac, mac, now, now)
-		_ = result
+		db.Exec("INSERT OR IGNORE INTO device_macs (device_id,mac,first_seen,last_seen) VALUES (?,?,?,?)", id, mac, now, now)
 	}
+	return id
 }
 
-func updateDevice(id int64, ip, mac, hostname string, now int64) {
-	q := "UPDATE devices SET last_seen=?, online_status='green'"
+func updateDev(id int64, ip, mac, hostname, vendorClass, fpHash string, now int64) {
+	q := "UPDATE devices SET last_seen=?"
 	args := []interface{}{now}
 	if mac != "" {
 		q += ", mac=?"
@@ -345,6 +296,14 @@ func updateDevice(id int64, ip, mac, hostname string, now int64) {
 		q += ", hostname=CASE WHEN hostname='' THEN ? ELSE hostname END"
 		args = append(args, hostname)
 	}
+	if vendorClass != "" {
+		q += ", vendor_class=?"
+		args = append(args, vendorClass)
+	}
+	if fpHash != "" {
+		q += ", opt55_hash=?"
+		args = append(args, fpHash)
+	}
 	if ip != "" && !strings.Contains(ip, ":") {
 		q += ", ipv4=CASE WHEN ipv4='' THEN ? ELSE ipv4 END"
 		args = append(args, ip)
@@ -352,90 +311,31 @@ func updateDevice(id int64, ip, mac, hostname string, now int64) {
 	q += " WHERE id=?"
 	args = append(args, id)
 	db.Exec(q, args...)
+	if mac != "" {
+		db.Exec("INSERT OR IGNORE INTO device_macs (device_id,mac,first_seen,last_seen) VALUES (?,?,?,?)", id, mac, now, now)
+	}
 }
 
-func ipOr(ip string) string {
-	if strings.Contains(ip, ":") {
-		return ""
-	}
-	return ip
-}
-
-func getMACviaIPNeigh(ip string) string {
-	// Try /proc/net/arp first (IPv4)
-	if !strings.Contains(ip, ":") {
-		out, _ := exec.Command("cat", "/proc/net/arp").Output()
-		for _, line := range strings.Split(string(out), "\n") {
-			f := strings.Fields(line)
-			if len(f) >= 4 && f[0] == ip {
-				return f[3]
-			}
-		}
-	}
-	// Try ip neigh (grep full table)
-	out, _ := exec.Command("sh", "-c", "ip neigh show | grep '"+ip+"' 2>/dev/null").Output()
-	for _, line := range strings.Split(string(out), "\n") {
-		idx := strings.Index(line, "lladdr ")
-		if idx > 0 {
-			return strings.SplitN(line[idx+7:], " ", 2)[0]
-		}
-	}
-	return ""
-}
-
-func getMAC(ip string) string {
-	out, _ := exec.Command("cat", "/proc/net/arp").Output()
-	for _, line := range strings.Split(string(out), "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 4 && f[0] == ip {
-			return f[3]
-		}
-	}
-	return ""
-}
-
-func getHostname(ip string) string {
-	out, _ := exec.Command("sh", "-c", "cat /tmp/hosts/dhcp.* /tmp/hosts/odhcpd.hosts.lan 2>/dev/null | grep '^"+ip+"[\t ]' | head -1").Output()
-	f := strings.Fields(string(out))
-	if len(f) >= 2 {
-		return f[1]
-	}
-	return ""
-}
-
-func hashOpt55(opt55 string) string {
-	if opt55 == "" {
-		return ""
-	}
-	h := sha256.Sum256([]byte(opt55))
-	return hex.EncodeToString(h[:])[:8]
-}
-
-func detectDeviceType(hostname, vendorClass string) string {
+func detectType(hostname, vendorClass string) string {
 	h := strings.ToLower(hostname)
 	v := strings.ToLower(vendorClass)
-
-	for _, kw := range []string{"iphone", "ipad", "apple", "macbook", "macmini"} {
+	for _, kw := range []string{"iphone", "ipad", "apple", "macbook"} {
 		if strings.Contains(h, kw) || strings.Contains(v, kw) {
 			return "Apple"
 		}
 	}
-	for _, kw := range []string{"android", "pixel", "samsung", "oneplus", "xiaomi"} {
+	for _, kw := range []string{"android", "pixel", "samsung"} {
 		if strings.Contains(h, kw) || strings.Contains(v, kw) {
 			return "Android"
 		}
 	}
-	for _, kw := range []string{"desktop-", "pc-", "windows", "win10", "win11"} {
-		if strings.Contains(h, kw) {
-			return "Windows"
-		}
+	if strings.Contains(h, "desktop-") || strings.Contains(h, "windows") {
+		return "Windows"
 	}
-	for _, kw := range []string{"ubuntu", "raspberry", "debian", "centos", "openwrt"} {
-		if strings.Contains(h, kw) || strings.Contains(v, kw) {
-			return "Linux"
-		}
+	if strings.Contains(h, "ubuntu") || strings.Contains(h, "raspberry") || strings.Contains(h, "openwrt") || strings.Contains(v, "dhcpcd-") {
+		return "Linux"
 	}
-	for _, kw := range []string{"mi", "lumi", "esp", "sonoff", "tasmota", "esphome", "xiaomi"} {
+	for _, kw := range []string{"xiaomi", "lumi", "esp", "sonoff", "tasmota"} {
 		if strings.Contains(h, kw) || strings.Contains(v, kw) {
 			return "IoT"
 		}
@@ -445,175 +345,81 @@ func detectDeviceType(hostname, vendorClass string) string {
 
 // ======== speed ========
 
-var prevBytes = map[string]uint64{}
-var firstSample = map[string]bool{}
-var speedMu sync.Mutex
-
-func speedCollector(wg *sync.WaitGroup) {
-	defer wg.Done()
-	t := time.NewTicker(3 * time.Second)
-	defer t.Stop()
-	for range t.C {
-		updateSpeed()
-		updateOnlineStatus()
-	}
-}
-
-func updateSpeed() {
-	now := time.Now().Unix()
-	out, _ := exec.Command("conntrack", "-L").Output()
-	cur := map[string]uint64{}
-	var ip string
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(line, "src=") {
-			ip = fieldVal(line, "src=")
-		}
-		if ip != "" && strings.Contains(line, "bytes=") {
-			bs := fieldVal(line, "bytes=")
-			n, _ := atoui(bs)
-			if isLAN(ip) && ip != "127.0.0.1" {
-				cur[ip] += n
-			}
-		}
-	}
-
-	speedMu.Lock()
-	mu.Lock()
-	for ip, total := range cur {
-		prev, ok := prevBytes[ip]
-		prevBytes[ip] = total
-		if !firstSample[ip] {
-			firstSample[ip] = true
-			continue
-		}
-		if !ok {
-			continue
-		}
-		delta := total - prev
-		speed := uint64(float64(delta) / 3.0 * 8)
-		if speed > 0 {
-			db.Exec("INSERT INTO traffic (device_id, speed_out, recorded_at) SELECT id,?,? FROM devices WHERE ipv4=?", speed, now, ip)
-		}
-	}
-	mu.Unlock()
-	speedMu.Unlock()
-}
-
-func updateOnlineStatus() {
-	now := time.Now().Unix()
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Update online status
-	db.Exec(`UPDATE devices SET online_status=CASE 
-		WHEN last_seen > ? THEN 'green' 
-		WHEN last_seen > ? THEN 'yellow' 
-		ELSE 'gray' END`, now-120, now-1800)
-
-	// Merge devices with same hostname
-	rows, _ := db.Query(`SELECT id, hostname, mac, ipv4, last_seen FROM devices WHERE hostname!='' ORDER BY hostname, last_seen DESC`)
-	if rows == nil {
-		return
-	}
-	defer rows.Close()
-
-	type dev struct {
-		id       int64
-		hostname string
-		mac      string
-		ipv4     string
-		lastSeen int64
-	}
-	seen := map[string]*dev{}
-	for rows.Next() {
-		var d dev
-		rows.Scan(&d.id, &d.hostname, &d.mac, &d.ipv4)
-		if keep, ok := seen[d.hostname]; ok {
-			// Merge this device into the keep device
-			if d.mac != "" && keep.mac == "" {
-				db.Exec("UPDATE devices SET mac=? WHERE id=?", d.mac, keep.id)
-			}
-			if d.ipv4 != "" && keep.ipv4 == "" {
-				db.Exec("UPDATE devices SET ipv4=? WHERE id=?", d.ipv4, keep.id)
-			}
-			db.Exec("UPDATE devices SET last_seen=MAX(last_seen,?) WHERE id=?", d.lastSeen, keep.id)
-			db.Exec("DELETE FROM devices WHERE id=?", d.id)
-		} else {
-			seen[d.hostname] = &d
-		}
-	}
-}
-
-// ======== rules ========
-
-func recoverRules() {
-	rows, _ := db.Query("SELECT id, ipv4, is_blocked, rate_limit FROM devices WHERE is_blocked=1 OR rate_limit>0")
-	if rows == nil {
-		return
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id int64
+func speedLoop() {
+	for {
+		time.Sleep(3 * time.Second)
+		now := time.Now().Unix()
+		out, _ := exec.Command("conntrack", "-L").Output()
+		cur := map[string]uint64{}
 		var ip string
-		var b, r int
-		rows.Scan(&id, &ip, &b, &r)
-		if b == 1 && ip != "" {
-			blockIP(ip)
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.Contains(line, "src=") {
+				ip = field(line, "src=")
+			}
+			if strings.Contains(line, "bytes=") && ip != "" {
+				bs := field(line, "bytes=")
+				n, _ := atoui(bs)
+				if isLAN(ip) && ip != "127.0.0.1" {
+					cur[ip] += n
+				}
+			}
 		}
-		if r > 0 && ip != "" {
-			limitIP(ip, r)
+		speedMu.Lock()
+		mu.Lock()
+		for ip, total := range cur {
+			prev, ok := prevBytes[ip]
+			prevBytes[ip] = total
+			if !firstSeen[ip] {
+				firstSeen[ip] = true
+				continue
+			}
+			if !ok {
+				continue
+			}
+			delta := total - prev
+			speed := uint64(float64(delta) / 3.0 * 8)
+			if speed > 0 {
+				db.Exec("INSERT INTO traffic (device_id,speed_out,recorded_at) SELECT id,?,? FROM devices WHERE ipv4=? AND ipv4!=''", speed, now, ip)
+			}
 		}
+		mu.Unlock()
+		speedMu.Unlock()
+
+		// Online status
+		mu.Lock()
+		db.Exec(`UPDATE devices SET last_seen=? WHERE ipv4 IN (SELECT ipv4 FROM devices WHERE last_seen>?)`, now, now-5)
+		mu.Unlock()
 	}
 }
 
-func ruleLoop(wg *sync.WaitGroup) {
-	defer wg.Done()
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	for range t.C {
-		enforce()
-	}
-}
+// ======== rules reconcile ========
 
-func enforce() {
-	rows, _ := db.Query("SELECT id, ipv4, is_blocked, rate_limit FROM devices WHERE online_status='green' AND ipv4!=''")
-	if rows == nil {
-		return
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id int64
-		var ip string
-		var b, r int
-		rows.Scan(&id, &ip, &b, &r)
-		if b == 1 && ip != "" {
-			blockIP(ip)
+func reconcileLoop() {
+	for {
+		time.Sleep(5 * time.Second)
+		mu.Lock()
+		rows, _ := db.Query("SELECT id, ipv4, is_blocked, rate_limit FROM devices WHERE ipv4!=''")
+		if rows != nil {
+			for rows.Next() {
+				var id int64
+				var ip string
+				var b, r int
+				rows.Scan(&id, &ip, &b, &r)
+				if b == 1 {
+					exec.Command(scriptDir+"/block.sh", "add", ip).Run()
+				} else {
+					exec.Command(scriptDir+"/block.sh", "del", ip).Run()
+				}
+				if r > 0 {
+					exec.Command(scriptDir+"/limit.sh", "set", fmt.Sprintf("%d", id), ip, fmt.Sprintf("%d", r)).Run()
+				} else {
+					exec.Command(scriptDir+"/limit.sh", "del", fmt.Sprintf("%d", id), ip, "0").Run()
+				}
+			}
+			rows.Close()
 		}
-		if r > 0 && ip != "" {
-			limitIP(ip, r)
-		}
+		mu.Unlock()
 	}
-}
-
-func blockIP(ip string) {
-	exec.Command("sh", "-c",
-		"nft add table ip devman 2>/dev/null; "+
-			"nft add chain ip devman forward '{ type filter hook forward priority filter - 1; }' 2>/dev/null; "+
-			"nft add rule ip devman forward ip saddr "+ip+" drop 2>/dev/null").Run()
-}
-
-func limitIP(ip string, kbps int) {
-	major := fmtIPtoHex(ip)
-	exec.Command("sh", "-c", fmt.Sprintf(
-		"tc qdisc add dev %s root handle 1: htb 2>/dev/null; tc class add dev %s parent 1: classid 1:%s htb rate %dkbit 2>/dev/null",
-		config.WANIF, config.WANIF, major, kbps,
-	)).Run()
-}
-
-func fmtIPtoHex(ip string) string {
-	var a, b, c, d int
-	fmt.Sscanf(ip, "%d.%d.%d.%d", &a, &b, &c, &d)
-	return fmt.Sprintf("%x%02x%02x%02x", a, b, c, d)[:6]
 }
 
 // ======== API ========
@@ -621,9 +427,10 @@ func fmtIPtoHex(ip string) string {
 func apiDevices(w http.ResponseWriter, r *http.Request) {
 	mu.RLock()
 	defer mu.RUnlock()
-	rows, _ := db.Query(`SELECT d.id, d.alias, d.hostname, d.device_type, d.ipv4, d.mac, d.is_blocked, d.rate_limit, d.last_seen, d.online_status,
+	rows, _ := db.Query(`SELECT d.id, d.alias, d.hostname, d.device_type, d.ipv4, d.mac, d.is_blocked, d.rate_limit, d.last_seen,
+		CASE WHEN d.last_seen > ? THEN 'green' WHEN d.last_seen > ? THEN 'yellow' ELSE 'gray' END,
 		(SELECT COUNT(*) FROM device_macs WHERE device_id=d.id)
-		FROM devices d ORDER BY d.last_seen DESC`)
+		FROM devices d ORDER BY d.last_seen DESC`, time.Now().Unix()-120, time.Now().Unix()-1800)
 	w.Header().Set("Content-Type", "application/json")
 	if rows == nil {
 		w.Write([]byte("[]"))
@@ -644,14 +451,10 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 
 func apiDHCPEvent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		MAC         string `json:"mac"`
-		IP          string `json:"ip"`
-		Hostname    string `json:"hostname"`
-		VendorClass string `json:"vendor_class"`
-		Opt55       string `json:"opt55"`
+		MAC, IP, Hostname, VendorClass, Opt55 string
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	upsertDevice(req.IP, req.MAC, req.Hostname, req.VendorClass, req.Opt55, "")
+	upsertDevice(req.IP, req.MAC, req.Hostname, req.VendorClass, req.Opt55)
 	w.Write([]byte(`{"ok":true}`))
 }
 
@@ -685,37 +488,36 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true}`))
 }
 
-func apiMerge(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		KeepID  int64 `json:"keep_id"`
-		MergeID int64 `json:"merge_id"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-	// Move MACs from merge to keep
-	db.Exec("UPDATE device_macs SET device_id=? WHERE device_id=?", req.KeepID, req.MergeID)
-	// Update keep with merge's best data
-	db.Exec(`UPDATE devices SET 
-		hostname=CASE WHEN (SELECT hostname FROM devices WHERE id=?)!='' THEN (SELECT hostname FROM devices WHERE id=?) ELSE hostname END,
-		alias=CASE WHEN (SELECT alias FROM devices WHERE id=?)!='' THEN (SELECT alias FROM devices WHERE id=?) ELSE alias END,
-		last_seen=MAX(last_seen, (SELECT last_seen FROM devices WHERE id=?))
-		WHERE id=?`, req.MergeID, req.MergeID, req.MergeID, req.MergeID, req.MergeID, req.KeepID)
-	// Delete merge device
-	db.Exec("DELETE FROM devices WHERE id=?", req.MergeID)
-	w.Write([]byte(`{"ok":true}`))
-}
-
-func apiDelete(w http.ResponseWriter, r *http.Request) {
-	// Parse /api/device/123
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/device/"), "/")
-	if len(parts) > 0 {
-		db.Exec("DELETE FROM devices WHERE id=?", parts[0])
-	}
-	w.Write([]byte(`{"ok":true}`))
-}
-
 // ======== helpers ========
 
-func fieldVal(line, key string) string {
+func getMAC(ip string) string {
+	out, _ := exec.Command("sh", "-c", "ip neigh show | grep '"+ip+"'").Output()
+	for _, line := range strings.Split(string(out), "\n") {
+		if idx := strings.Index(line, "lladdr "); idx > 0 {
+			return strings.SplitN(line[idx+7:], " ", 2)[0]
+		}
+	}
+	return ""
+}
+
+func getHostname(ip string) string {
+	out, _ := exec.Command("sh", "-c", "cat /tmp/hosts/dhcp.* /tmp/hosts/odhcpd.hosts.lan 2>/dev/null | grep '^"+ip+"[\t ]' | head -1").Output()
+	f := strings.Fields(string(out))
+	if len(f) >= 2 {
+		return f[1]
+	}
+	return ""
+}
+
+func hashOpt55(s string) string {
+	if s == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])[:8]
+}
+
+func field(line, key string) string {
 	idx := strings.Index(line, key)
 	if idx < 0 {
 		return ""
@@ -723,11 +525,20 @@ func fieldVal(line, key string) string {
 	return strings.SplitN(line[idx+len(key):], " ", 2)[0]
 }
 
-func isLAN(ip string) bool {
-	return strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "10.") ||
-		strings.HasPrefix(ip, "172.16.") || strings.HasPrefix(ip, "fd") ||
-		strings.HasPrefix(ip, "fe80:") || strings.HasPrefix(ip, "2408:") ||
-		strings.HasPrefix(ip, "240e:")
+func isLAN(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 10 ||
+			(ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) ||
+			(ip4[0] == 192 && ip4[1] == 168) ||
+			ip.IsPrivate()
+	}
+	return len(ip) == net.IPv6len &&
+		((ip[0]&0xfe) == 0xfc ||
+			(ip[0] == 0xfe && ip[1]&0xc0 == 0x80))
 }
 
 func atoui(s string) (uint64, error) {
