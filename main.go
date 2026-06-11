@@ -96,8 +96,13 @@ func initDB() {
 		)`,
 		`CREATE TABLE IF NOT EXISTS device_macs (
 			device_id INTEGER NOT NULL, mac TEXT NOT NULL,
-			first_seen INTEGER DEFAULT 0, last_seen INTEGER DEFAULT 0
+			first_seen INTEGER DEFAULT 0, last_seen INTEGER DEFAULT 0,
+			UNIQUE(device_id, mac)
 		)`,
+
+		// Migration for old DBs
+		`DELETE FROM device_macs WHERE id NOT IN (SELECT MIN(id) FROM device_macs GROUP BY device_id, mac)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_device_macs_unique ON device_macs(device_id, mac)`,
 		`CREATE TABLE IF NOT EXISTS traffic (
 			device_id INTEGER NOT NULL, speed_out INTEGER DEFAULT 0,
 			recorded_at INTEGER DEFAULT 0
@@ -216,7 +221,15 @@ func leaseLoop() {
 		for _, line := range strings.Split(string(out), "\n") {
 			f := strings.Fields(line)
 			if len(f) >= 2 && isLAN(f[0]) && f[1] != "" {
-				db.Exec("UPDATE devices SET hostname=CASE WHEN hostname='' THEN ? ELSE hostname END WHERE ipv4=? OR mac IN (SELECT mac FROM device_macs)", f[1], f[0])
+				hostname := f[1]
+				ip := f[0]
+				// ipv4 exact match
+				db.Exec("UPDATE devices SET hostname=CASE WHEN hostname='' THEN ? ELSE hostname END WHERE ipv4=?", hostname, ip)
+				// MAC bridge via neigh
+				mac := getMACviaNeigh(ip)
+				if mac != "" {
+					db.Exec("UPDATE devices SET hostname=CASE WHEN hostname='' THEN ? ELSE hostname END WHERE mac=?", hostname, mac)
+				}
 			}
 		}
 		mu.Unlock()
@@ -329,7 +342,7 @@ func detectType(hostname, vendorClass string) string {
 			return "Android"
 		}
 	}
-	if strings.Contains(h, "desktop-") || strings.Contains(h, "windows") {
+	if strings.Contains(h, "desktop-") || strings.Contains(h, "compil") || strings.Contains(h, "windows") {
 		return "Windows"
 	}
 	if strings.Contains(h, "ubuntu") || strings.Contains(h, "raspberry") || strings.Contains(h, "openwrt") || strings.Contains(v, "dhcpcd-") {
@@ -429,7 +442,7 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 	defer mu.RUnlock()
 	rows, _ := db.Query(`SELECT d.id, d.alias, d.hostname, d.device_type, d.ipv4, d.mac, d.is_blocked, d.rate_limit, d.last_seen,
 		CASE WHEN d.last_seen > ? THEN 'green' WHEN d.last_seen > ? THEN 'yellow' ELSE 'gray' END,
-		(SELECT COUNT(*) FROM device_macs WHERE device_id=d.id)
+		(SELECT COUNT(DISTINCT mac) FROM device_macs WHERE device_id=d.id)
 		FROM devices d ORDER BY d.last_seen DESC`, time.Now().Unix()-120, time.Now().Unix()-1800)
 	w.Header().Set("Content-Type", "application/json")
 	if rows == nil {
@@ -489,6 +502,16 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======== helpers ========
+
+func getMACviaNeigh(ip string) string {
+	out, _ := exec.Command("sh", "-c", "ip neigh show | grep '"+ip+"'").Output()
+	for _, line := range strings.Split(string(out), "\n") {
+		if idx := strings.Index(line, "lladdr "); idx > 0 {
+			return strings.SplitN(line[idx+7:], " ", 2)[0]
+		}
+	}
+	return ""
+}
 
 func getMAC(ip string) string {
 	out, _ := exec.Command("sh", "-c", "ip neigh show | grep '"+ip+"'").Output()
