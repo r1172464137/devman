@@ -388,11 +388,10 @@ func useRawSocket() {
 			msgType, mac, ip, hostname, vendorClass, opt55hex[:min(8, len(opt55hex))])
 
 		if mac != "" && isLAN(ip) {
-			// Fingerprint device by MAC+hostname+(vendor+opt55)
-			upsertDevice(ip, mac, hostname, vendorClass, opt55hex)
-			// Also update ipv4 on any device with this MAC
+			id := upsertDevice(ip, mac, hostname, vendorClass, opt55hex)
 			mu.Lock()
-			db.Exec("UPDATE devices SET ipv4=? WHERE mac=? AND ipv4!=?", ip, mac, ip)
+			// Always update IP from DHCP (most recent binding)
+			db.Exec("UPDATE devices SET ipv4=? WHERE id=?", ip, id)
 			mu.Unlock()
 		}
 	}

@@ -1,46 +1,66 @@
 <%+header%>
 <style>
 .dm-wrap{padding:16px}
-.dm-table{width:100%;border-collapse:collapse;font-size:13px}
-.dm-table th,.dm-table td{padding:6px 10px;border-bottom:1px solid var(--cbi-border,#e0e0e0);text-align:left;white-space:nowrap}
-.dm-table th{background:var(--cbi-bg,#f5f5f5);font-weight:600}
-.dm-on{color:#22c55e}.dm-off{color:#9ca3af}.dm-blocked{color:#ef4444;font-weight:600}
-.dm-mac{font-family:monospace;font-size:11px;color:#666}
-.dm-speed{font-variant-numeric:tabular-nums}
-.dm-btn{padding:3px 8px;border-radius:3px;border:none;cursor:pointer;font-size:11px;margin:1px}
-.dm-btn-block{background:#ef4444;color:#fff}
-.dm-btn-unblock{background:#22c55e;color:#fff}
-.dm-btn-rename{background:#6366f1;color:#fff}
-.dm-empty{text-align:center;padding:32px;color:#9ca3af}
+.dm-table{width:100%;border-collapse:collapse;font-size:13px;color:#1a1a1a;background:#fff}
+.dm-table th{background:#e8e8e8;font-weight:600;color:#111}
+.dm-table th,.dm-table td{padding:8px 10px;border-bottom:1px solid #d0d0d0;text-align:left}
+.dm-table tr:hover{background:#f5f5f5}
+.dm-on{color:#0d7c3e;font-weight:700}
+.dm-yellow{color:#b85c00}
+.dm-off{color:#aaa}
+.dm-blocked{color:#c00;font-weight:700}
+.dm-mac{font:11px monospace;color:#777}
+.dm-type{font-size:11px;padding:2px 6px;border-radius:3px;background:#eee;color:#555}
+.dm-speed{font-weight:600}
+.dm-btn{padding:4px 10px;border-radius:4px;border:none;cursor:pointer;font-size:12px;font-weight:600;margin:1px}
+.dm-btn-block{background:#c00;color:#fff}
+.dm-btn-unblock{background:#0a0;color:#fff}
+.dm-btn-rename{background:#55f;color:#fff}
+.dm-empty{text-align:center;padding:40px;color:#aaa;font-size:14px}
+
+/* dark mode */
+html[data-darkmode=true] .dm-table{color:#e0e0e0;background:#1a1a1a}
+html[data-darkmode=true] .dm-table th{background:#2a2a2a;color:#ddd}
+html[data-darkmode=true] .dm-table td{border-color:#333}
+html[data-darkmode=true] .dm-table tr:hover{background:#222}
+html[data-darkmode=true] .dm-on{color:#4ade80}
+html[data-darkmode=true] .dm-yellow{color:#fbbf24}
+html[data-darkmode=true] .dm-off{color:#666}
+html[data-darkmode=true] .dm-blocked{color:#f87171}
+html[data-darkmode=true] .dm-mac{color:#888}
+html[data-darkmode=true] .dm-type{background:#333;color:#aaa}
+html[data-darkmode=true] .dm-empty{color:#666}
 </style>
 <div class="dm-wrap">
-<h2><%:Device Manager%></h2>
-<div id="dm-content"><p class="dm-empty"><%:Loading...%></p></div>
+<h2>Device Manager</h2>
+<div id="dm-content"><p class="dm-empty">Loading...</p></div>
 </div>
 <script>
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function fmtSpeed(bps){if(!bps)return'0 bps';if(bps>=1e6)return(bps/1e6).toFixed(1)+' Mbps';if(bps>=1e3)return(bps/1e3).toFixed(1)+' Kbps';return bps+' bps'}
+function status(s){
+ if(s==='green')return'<span class="dm-on">● Online</span>';
+ if(s==='yellow')return'<span class="dm-yellow">◐ Maybe</span>';
+ return'<span class="dm-off">○ Offline</span>';
+}
 function load(){
  fetch('/cgi-bin/luci/admin/network/devman/api_devices').then(r=>r.json()).then(function(d){
   var c=document.getElementById('dm-content');
-  if(!d||!d.length){c.innerHTML='<p class="dm-empty"><%:No devices detected yet. Connect a device to see it here.%></p>';return}
-  var h='<table class="dm-table"><thead><tr><th><%:Name%></th><th>IPv4</th><th>IPv6</th><th>MAC</th><th><%:State%></th><th><%:Speed%></th><th><%:Blocked%></th><th><%:Actions%></th></tr></thead><tbody>';
+  if(!d||!d.length){c.innerHTML='<p class="dm-empty">No devices detected yet</p>';return}
+  var h='<table class="dm-table"><thead><tr><th>Name</th><th>Type</th><th>IP</th><th>MAC</th><th>Status</th><th>Speed</th><th>Block</th><th>Actions</th></tr></thead><tbody>';
   d.forEach(function(dev){
-   var name=dev.alias||dev.hostname||'Device#'+dev.id;
-   var st=dev.online?'<span class="dm-on">● <%:Online%></span>':'<span class="dm-off">○ <%:Offline%></span>';
-   var bl=dev.is_blocked?'<span class="dm-blocked">■</span>':'';
-   var sp=fmtSpeed(dev.speed_out||0);
+   var name=dev.alias||dev.hostname||('Device#'+dev.id);
+   var tp=dev.device_type!=='Unknown'?'<span class="dm-type">'+esc(dev.device_type)+'</span>':'<span class="dm-type">-</span>';
    h+='<tr>';
-   h+='<td><b>'+esc(name)+'</b></td>';
+   h+='<td><b>'+esc(name)+'</b></td><td>'+tp+'</td>';
    h+='<td>'+esc(dev.current_ip||'-')+'</td>';
-   h+='<td style="font-size:11px;color:#666">'+(dev.current_ip6||'').slice(0,18)+'...</td>';
    h+='<td class="dm-mac">'+esc(dev.current_mac||'-')+'</td>';
-   h+='<td>'+st+'</td>';
-   h+='<td class="dm-speed">'+sp+'</td>';
-   h+='<td>'+bl+'</td>';
+   h+='<td>'+status(dev.online)+'</td>';
+   h+='<td class="dm-speed">'+fmtSpeed(dev.speed_out||0)+'</td>';
+   h+='<td>'+(dev.is_blocked?'<span class="dm-blocked">■</span>':'')+'</td>';
    h+='<td>';
-   h+=dev.is_blocked?'<button class="dm-btn dm-btn-unblock" onclick="tb('+dev.id+',0)"><%:Unblock%></button>':'<button class="dm-btn dm-btn-block" onclick="tb('+dev.id+',1)"><%:Block%></button>';
-   h+=' <button class="dm-btn dm-btn-rename" onclick="rn('+dev.id+',\''+esc(name)+'\')"><%:Rename%></button>';
+   h+=dev.is_blocked?'<button class="dm-btn dm-btn-unblock" onclick="tb('+dev.id+',0)">Unblock</button>':'<button class="dm-btn dm-btn-block" onclick="tb('+dev.id+',1)">Block</button>';
+   h+=' <button class="dm-btn dm-btn-rename" onclick="rn('+dev.id+',\''+esc(name)+'\')">Rename</button>';
    h+='</td></tr>';
   });
   h+='</tbody></table>';
@@ -48,7 +68,7 @@ function load(){
  });
 }
 function tb(id,b){fetch('/cgi-bin/luci/admin/network/devman/api_block?device_id='+id+'&block='+b).then(load)}
-function rn(id,n){var p=prompt('<%:New name:%>',n);if(p&&p!==n)fetch('/cgi-bin/luci/admin/network/devman/api_limit?device_id='+id+'&rate_limit=-1&alias='+encodeURIComponent(p)).then(load)}
+function rn(id,n){var p=prompt('New name:',n);if(p&&p!==n)fetch('/cgi-bin/luci/admin/network/devman/api_limit?device_id='+id+'&rate_limit=-1&alias='+encodeURIComponent(p)).then(load)}
 load();setInterval(load,5000);
 </script>
 <%+footer%>
