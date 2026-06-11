@@ -82,6 +82,7 @@ func main() {
 	installScripts()
 	initTC()
 	initNFT()
+	db.Exec("UPDATE devices SET device_type='Unknown' WHERE device_type='' OR device_type IS NULL")
 	// Immediately fill hostnames from existing leases
 	fillHostnamesFromLeases()
 
@@ -193,7 +194,11 @@ curl -s -X POST http://127.0.0.1:9999/api/dhcp-event -H "Content-Type: applicati
 }
 
 func initTC()  { exec.Command(scriptDir+"/limit.sh", "init").Run() }
-func initNFT() { exec.Command(scriptDir+"/block.sh", "init").Run() }
+func initNFT() {
+	exec.Command(scriptDir+"/block.sh", "init").Run()
+	// Create traffic counting chain
+	exec.Command("sh", "-c", "nft add table ip devman2 2>/dev/null; nft add chain ip devman2 forward { type filter hook forward priority filter - 2; } 2>/dev/null; nft add set ip devman2 devices { type ipv4_addr; } 2>/dev/null; nft add rule ip devman2 forward ip saddr @devices counter 2>/dev/null; nft add rule ip devman2 forward ip daddr @devices counter 2>/dev/null").Run()
+}
 
 func fillHostnamesFromLeases() {
 	out, _ := os.ReadFile("/etc/dhcp.leases")
@@ -657,7 +662,7 @@ func detectTypeByMAC(mac string) string {
 		"688b87", "6c2995", "6cbb18", "704529", "707c18", "74546c", "7824af":
 		return "Android"
 	}
-	return ""
+	return "Unknown"
 }
 
 func detectType(hostname, vendorClass string) string {
@@ -694,84 +699,66 @@ func detectType(hostname, vendorClass string) string {
 	return "Unknown"
 }
 
-// ======== speed ========
+// ======== speed via nftables counters ========
+
+var nftPrevUp = map[string]uint64{}
+var nftPrevDown = map[string]uint64{}
+var nftFirst = map[string]bool{}
 
 func speedLoop() {
+	var prevUp = map[string]uint64{}
+	var prevDown = map[string]uint64{}
+	var first = map[string]bool{}
+
 	for {
 		time.Sleep(3 * time.Second)
 		now := time.Now().Unix()
 		out, _ := exec.Command("conntrack", "-L").Output()
-		curOut := map[string]uint64{}
-		curIn := map[string]uint64{}
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.Contains(line, "bytes=") {
-				continue
-			}
-			// Format: src=LANIP dst=WANIP ... bytes=OUT ... src=WANIP dst=LANIP ... bytes=IN
-			idx := strings.Index(line, " src=")
-			if idx < 0 {
-				continue
-			}
-			src1 := strings.SplitN(line[idx+5:], " ", 2)[0]
-			// Find first and last bytes=
-			firstBytes := strings.Index(line, "bytes=")
-			lastBytes := strings.LastIndex(line, "bytes=")
-			var outBytes, inBytes uint64
-			if firstBytes >= 0 {
-				bs := strings.SplitN(line[firstBytes+6:], " ", 2)[0]
-				outBytes, _ = atoui(bs)
-			}
-			if lastBytes > firstBytes {
-				bs := strings.SplitN(line[lastBytes+6:], " ", 2)[0]
-				inBytes, _ = atoui(bs)
-			}
-			if isLAN(src1) && src1 != "127.0.0.1" {
-				curOut[src1] += outBytes
-				curIn[src1] += inBytes
-			}
-		}
-		speedMu.Lock()
-		mu.Lock()
-		for ip, total := range curOut {
-			key := "out:" + ip
-			prev, ok := prevBytes[key]
-			prevBytes[key] = total
-			if !firstSeen[key] {
-				firstSeen[key] = true
-				continue
-			}
-			if !ok {
-				continue
-			}
-			delta := total - prev
-			speed := uint64(float64(delta) / 3.0 * 8)
-			if speed > 0 {
-				db.Exec("INSERT INTO traffic (device_id,speed_in,recorded_at) SELECT id,?,? FROM devices WHERE ipv4=? AND ipv4!=''", speed, now, ip)
-			}
-		}
-		for ip, total := range curIn {
-			key := "in:" + ip
-			prev, ok := prevBytes[key]
-			prevBytes[key] = total
-			if !firstSeen[key] {
-				firstSeen[key] = true
-				continue
-			}
-			if !ok {
-				continue
-			}
-			delta := total - prev
-			speed := uint64(float64(delta) / 3.0 * 8)
-			if speed > 0 {
-				db.Exec("INSERT INTO traffic (device_id,speed_out,recorded_at) SELECT id,?,? FROM devices WHERE ipv4=? AND ipv4!=''", speed, now, ip)
-			}
-		}
-		mu.Unlock()
-		speedMu.Unlock()
+		curUp := map[string]uint64{}
+		curDown := map[string]uint64{}
 
-		// Online status
+		for _, line := range strings.Split(string(out), "\n") {
+			// Each conntrack line has 2x src/dst pairs and 2x bytes= values
+			// First bytes= is for original direction (upload from LAN src)
+			// Second bytes= is for reply direction (download to LAN dst)
+			sIdx := strings.Index(line, " src=")
+			if sIdx < 0 { continue }
+			src := strings.SplitN(line[sIdx+5:], " ", 2)[0]
+			if !isLAN(src) || src == "127.0.0.1" {
+				continue
+			}
+			firstB := strings.Index(line, "bytes=")
+			lastB := strings.LastIndex(line, "bytes=")
+			if firstB < 0 {
+				continue
+			}
+			upBytes, _ := atoui(strings.SplitN(line[firstB+6:], " ", 2)[0])
+			curUp[src] += upBytes
+			if lastB > firstB {
+				downBytes, _ := atoui(strings.SplitN(line[lastB+6:], " ", 2)[0])
+				curDown[src] += downBytes
+			}
+		}
+
 		mu.Lock()
-		db.Exec(`UPDATE devices SET last_seen=? WHERE ipv4 IN (SELECT ipv4 FROM devices WHERE last_seen>?)`, now, now-5)
+		for ip, total := range curUp {
+			if !first[ip] {
+				prevUp[ip] = total
+				prevDown[ip] = curDown[ip]
+				first[ip] = true
+				continue
+			}
+			upDelta := total - prevUp[ip]
+			downDelta := curDown[ip] - prevDown[ip]
+			prevUp[ip] = total
+			prevDown[ip] = curDown[ip]
+			if speed := uint64(float64(upDelta) / 3.0 * 8); speed > 0 {
+				db.Exec("INSERT INTO traffic (device_id,speed_in,recorded_at) SELECT id,?,? FROM devices WHERE ipv4=?", speed, now, ip)
+			}
+			if speed := uint64(float64(downDelta) / 3.0 * 8); speed > 0 {
+				db.Exec("INSERT INTO traffic (device_id,speed_out,recorded_at) SELECT id,?,? FROM devices WHERE ipv4=?", speed, now, ip)
+			}
+		}
 		mu.Unlock()
 	}
 }
@@ -831,7 +818,7 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 	rows, _ := db.Query(`SELECT d.id, d.alias, d.hostname, d.device_type, d.ipv4, d.mac, d.vendor_class, d.opt55_hash, d.is_blocked, d.rate_limit, d.last_seen,
 		CASE WHEN d.last_seen > ? THEN 'green' WHEN d.last_seen > ? THEN 'yellow' ELSE 'gray' END,
 		(SELECT COUNT(DISTINCT mac) FROM device_macs WHERE device_id=d.id)
-		FROM devices d ORDER BY d.first_seen DESC`, time.Now().Unix()-120, time.Now().Unix()-1800)
+		FROM devices d ORDER BY d.ipv4 ASC`, time.Now().Unix()-120, time.Now().Unix()-1800)
 	w.Header().Set("Content-Type", "application/json")
 	if rows == nil {
 		w.Write([]byte("[]"))
@@ -843,6 +830,9 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 		var d DeviceProfile
 		var b int
 		rows.Scan(&d.ID, &d.Alias, &d.Hostname, &d.DeviceType, &d.CurrentIP, &d.CurrentMAC, &d.VendorClass, &d.Opt55Hash, &b, &d.RateLimit, &d.LastSeen, &d.Online, &d.NumMACs)
+		if d.DeviceType == "" {
+			d.DeviceType = "Unknown"
+		}
 		d.IsBlocked = b == 1
 		db.QueryRow("SELECT COALESCE(speed_out,0) FROM traffic WHERE device_id=? ORDER BY recorded_at DESC LIMIT 1", d.ID).Scan(&d.SpeedOut)
 		db.QueryRow("SELECT COALESCE(speed_in,0) FROM traffic WHERE device_id=? ORDER BY recorded_at DESC LIMIT 1", d.ID).Scan(&d.SpeedIn)

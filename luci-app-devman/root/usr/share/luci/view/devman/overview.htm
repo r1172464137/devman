@@ -50,7 +50,7 @@ function load(){
   var h='<table class="dm-table"><thead><tr><th>Name</th><th>Type</th><th>IP</th><th>MAC</th><th>Status</th><th>Speed</th><th>Block</th><th>Actions</th></tr></thead><tbody>';
   d.forEach(function(dev){
    var name=dev.alias||dev.hostname||('Device#'+dev.id);
-   var tp=dev.device_type!=='Unknown'?'<span class="dm-type">'+esc(dev.device_type)+'</span>':'<span class="dm-type">-</span>';
+   var tp='<span class="dm-type">'+esc(dev.device_type)+'</span>';
    h+='<tr>';
    h+='<td><b>'+esc(name)+'</b></td><td>'+tp+'</td>';
    h+='<td>'+esc(dev.current_ip||'-')+'</td>';
