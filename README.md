@@ -1,57 +1,64 @@
-# devman - OpenWrt Device Manager
+# devman — OpenWrt Device Manager
 
-Real-time device monitoring and control for OpenWrt routers.
+Real-time device monitoring and control daemon + LuCI UI.
 
 ## Features
 
-- **Auto-discover** all LAN devices (conntrack + DHCP lease scanning)
-- **Device merge** — IPv4/IPv6 for same MAC merged into one
-- **Per-device speed** — real-time traffic rate (bps)
-- **Hostname detection** — reads from dnsmasq & odhcpd leases
-- **Block** — instantly cut internet for any device (nftables drop)
-- **Limit** — per-device bandwidth cap (tc htb)
-- **Rename** — custom device aliases
-- **Web UI** — LuCI integration with auto-refresh
+| Feature | Description |
+|---------|-------------|
+| Auto-discovery | `ip neigh` + conntrack, no polling |
+| Hostnames | Reads dnsmasq DHCP leases |
+| DHCP fingerprint | Raw AF_PACKET socket captures Option 60+55 |
+| Device type | MAC OUI lookup + random MAC detection |
+| Per-device speed | Conntrack byte delta (lazy-calc, only on API call) |
+| Block | nftables set, O(1) drop |
+| Rate limit | nftables limit (no kernel modules needed) |
+| Merge | Fingerprint-based dedup, survives privacy MAC switch |
+| Persistence | SQLite at `/etc/devman/devman.db` |
 
-## Architecture
+## Structure
 
 ```
-devman (Go daemon, /usr/bin/devman)
-  ├─ conntrack -E  → detect new devices
-  ├─ DHCP lease scan → hostname + IP
-  ├─ conntrack -L   → per-IP byte counters → real-time speed
-  ├─ nftables       → block/allow
-  ├─ tc htb          → rate limit
-  └─ HTTP :9999     → JSON API
-
-luci-app-devman
-  └─ LuCI controller + view → Web UI
+devman/
+├── devman/                  # Go daemon package
+│   ├── src/main.go          # 1200+ lines, pure Go
+│   ├── src/go.mod           # SQLite dependency
+│   └── files/               # init script + shell scripts
+├── luci-app-devman/         # LuCI frontend
+│   ├── luasrc/controller/   # Lua API proxy
+│   ├── root/usr/share/luci/ # View templates + menu
+│   └── po/                  # Translations (zh-cn)
+└── Makefile                 # Top-level build
 ```
 
-## Install
+## Quick Build
 
 ```bash
-opkg install devman_*.ipk luci-app-devman_*.ipk
-/etc/init.d/devman start
-```
+# Go daemon (standalone)
+make
 
-Open LuCI → Network → Device Manager
+# Or via OpenWrt build system
+./scripts/feeds update luci
+./scripts/feeds install -a -p luci
+cp -r feeds/luci/../devman package/
+make package/devman/compile V=s
+make package/luci-app-devman/compile V=s
+```
 
 ## Requirements
 
-- OpenWrt 23.05+
+- OpenWrt 23.05+ / ImmortalWrt 24.10+
 - nftables (firewall4)
-- conntrack
+- dnsmasq (for DHCP hostnames)
 
-## Build
+## API
 
-```bash
-# Go backend (pure Go, no CGO)
-CGO_ENABLED=0 go build -ldflags="-s -w" -o devman .
-
-# LuCI frontend (via OpenWrt build system)
-make package/luci-app-devman/compile
-```
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/api/devices` | GET | Device list (triggers speed calc) |
+| `/api/block` | POST | Block/unblock `{device_id, block}` |
+| `/api/limit` | POST | Rate limit/rename `{device_id, rate_limit, alias}` |
+| `/api/dhcp-event` | POST | DHCP fingerprint hook |
 
 ## License
 
