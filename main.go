@@ -32,6 +32,7 @@ type DeviceProfile struct {
 	LastSeen   int64  `json:"last_seen"`
 	Online     string `json:"online"`
 	SpeedOut   uint64 `json:"speed_out"`
+	SpeedIn    uint64 `json:"speed_in"`
 	NumMACs    int    `json:"num_macs"`
 }
 
@@ -56,6 +57,25 @@ func main() {
 	}
 	defer db.Close()
 	initDB()
+	// Update existing device types from MAC OUI + hostname
+	rows, _ := db.Query("SELECT id, mac, hostname FROM devices WHERE device_type='Unknown' AND (mac!='' OR hostname!='')")
+	if rows != nil {
+		for rows.Next() {
+			var id int64
+			var mac, hostname string
+			rows.Scan(&id, &mac, &hostname)
+			dt := detectType(hostname, "")
+			if dt == "Unknown" && mac != "" {
+				dt = detectTypeByMAC(mac)
+			}
+			if dt != "" && dt != "Unknown" {
+				db.Exec("UPDATE devices SET device_type=? WHERE id=?", dt, id)
+			}
+		}
+		rows.Close()
+	}
+	// Merge any duplicate hostnames from previous sessions
+	mergeDuplicateHostnames()
 
 	installScripts()
 	initTC()
@@ -104,9 +124,10 @@ func initDB() {
 		`DELETE FROM device_macs WHERE id NOT IN (SELECT MIN(id) FROM device_macs GROUP BY device_id, mac)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_device_macs_unique ON device_macs(device_id, mac)`,
 		`CREATE TABLE IF NOT EXISTS traffic (
-			device_id INTEGER NOT NULL, speed_out INTEGER DEFAULT 0,
+			device_id INTEGER NOT NULL, speed_out INTEGER DEFAULT 0, speed_in INTEGER DEFAULT 0,
 			recorded_at INTEGER DEFAULT 0
 		)`,
+		`ALTER TABLE traffic ADD COLUMN speed_in INTEGER DEFAULT 0`,
 	} {
 		db.Exec(q)
 	}
@@ -154,16 +175,10 @@ curl -s -X POST http://127.0.0.1:9999/api/dhcp-event -H "Content-Type: applicati
 	for name, content := range scripts {
 		os.WriteFile(scriptDir+"/"+name, []byte(content), 0755)
 	}
-	// Ensure dnsmasq hook
+	// Ensure dnsmasq hook via /etc/dnsmasq.d/ (survives UCI regeneration)
 	hook := scriptDir + "/dhcp-hook.sh"
-	cfg, _ := os.ReadFile("/etc/dnsmasq.conf")
-	if !strings.Contains(string(cfg), "dhcp-script="+hook) {
-		f, _ := os.OpenFile("/etc/dnsmasq.conf", os.O_APPEND|os.O_WRONLY, 0644)
-		if f != nil {
-			f.WriteString("\ndhcp-script=" + hook + "\ndhcp-authoritative\n")
-			f.Close()
-		}
-	}
+	os.MkdirAll("/etc/dnsmasq.d", 0755)
+	os.WriteFile("/etc/dnsmasq.d/devman.conf", []byte("dhcp-script="+hook+"\n"), 0644)
 }
 
 func initTC()  { exec.Command(scriptDir+"/limit.sh", "init").Run() }
@@ -216,19 +231,19 @@ func conntrackLoop() {
 
 func leaseLoop() {
 	for {
-		out, _ := exec.Command("sh", "-c", "cat /tmp/hosts/dhcp.* /tmp/hosts/odhcpd.hosts.lan 2>/dev/null | grep -v '^#'").Output()
+		// Read dnsmasq lease file: expiry MAC IP HOSTNAME client_id
+		out, _ := exec.Command("cat", "/etc/dhcp.leases").Output()
 		mu.Lock()
 		for _, line := range strings.Split(string(out), "\n") {
 			f := strings.Fields(line)
-			if len(f) >= 2 && isLAN(f[0]) && f[1] != "" {
-				hostname := f[1]
-				ip := f[0]
-				// ipv4 exact match
-				db.Exec("UPDATE devices SET hostname=CASE WHEN hostname='' THEN ? ELSE hostname END WHERE ipv4=?", hostname, ip)
-				// MAC bridge via neigh
-				mac := getMACviaNeigh(ip)
-				if mac != "" {
-					db.Exec("UPDATE devices SET hostname=CASE WHEN hostname='' THEN ? ELSE hostname END WHERE mac=?", hostname, mac)
+			if len(f) >= 4 && isLAN(f[2]) && f[3] != "" && f[3] != "*" {
+				hostname := f[3]
+				ip := f[2]
+				// Set hostname on matching device
+				r, _ := db.Exec("UPDATE devices SET hostname=? WHERE ipv4=? AND hostname=''", hostname, ip)
+				rows, _ := r.RowsAffected()
+				if rows > 0 {
+					mergeDuplicateHostnames()
 				}
 			}
 		}
@@ -250,8 +265,15 @@ func upsertDevice(ip, mac, hostname, vendorClass, opt55 string) int64 {
 	fpHash := hashOpt55(opt55)
 	if hostname == "" {
 		hostname = getHostname(ip)
+		// If still empty, try all leases for a matching hostname (for random MAC phones)
+		if hostname == "" {
+			hostname = searchHostnameByIP(ip)
+		}
 	}
 	devType := detectType(hostname, vendorClass)
+	if devType == "Unknown" && mac != "" {
+		devType = detectTypeByMAC(mac)
+	}
 
 	// Tier 1: MAC
 	if mac != "" {
@@ -284,6 +306,15 @@ func upsertDevice(ip, mac, hostname, vendorClass, opt55 string) int64 {
 		}
 	}
 
+	// Final check: after all tiers failed, try to merge by hostname (phone changed MAC)
+	if hostname != "" {
+		var id int64
+		if db.QueryRow("SELECT id FROM devices WHERE hostname=? LIMIT 1", hostname).Scan(&id) == nil {
+			updateDev(id, ip, mac, hostname, vendorClass, fpHash, now)
+			return id
+		}
+	}
+
 	// New device
 	ipv4 := ""
 	if !strings.Contains(ip, ":") {
@@ -308,6 +339,11 @@ func updateDev(id int64, ip, mac, hostname, vendorClass, fpHash string, now int6
 	if hostname != "" {
 		q += ", hostname=CASE WHEN hostname='' THEN ? ELSE hostname END"
 		args = append(args, hostname)
+		// Update device type from hostname
+		if dt := detectType(hostname, ""); dt != "" {
+			q += ", device_type=CASE WHEN device_type='Unknown' THEN ? ELSE device_type END"
+			args = append(args, dt)
+		}
 	}
 	if vendorClass != "" {
 		q += ", vendor_class=?"
@@ -326,32 +362,138 @@ func updateDev(id int64, ip, mac, hostname, vendorClass, fpHash string, now int6
 	db.Exec(q, args...)
 	if mac != "" {
 		db.Exec("INSERT OR IGNORE INTO device_macs (device_id,mac,first_seen,last_seen) VALUES (?,?,?,?)", id, mac, now, now)
+		// Update device type from MAC OUI if still Unknown
+		if dt := detectTypeByMAC(mac); dt != "" {
+			db.Exec("UPDATE devices SET device_type=? WHERE id=? AND device_type='Unknown'", dt, id)
+		}
 	}
+}
+
+func detectTypeByMAC(mac string) string {
+	mac = strings.ToLower(strings.ReplaceAll(mac, ":", ""))
+	if len(mac) < 6 {
+		return ""
+	}
+	oui := mac[:6]
+	// Detect randomized/local MAC (bit 1 of first byte = 1 → locally administered)
+	if len(mac) >= 2 {
+		firstByte, _ := hexToByte(mac[:2])
+		if firstByte&0x2 != 0 {
+			return "Mobile"
+		}
+	}
+	switch oui {
+	// Apple
+	case "001e52", "0019e3", "002241", "002312", "002436", "00254b", "002608", "00264a",
+		"003065", "0030f4", "0050e4", "006171", "006973", "008061", "00a040", "00b362",
+		"00c610", "00d3e1", "00f4b9", "047d7b", "080007", "0c1539", "0c3021", "0c3e9f",
+		"0c4de9", "0c5101", "102b96", "109add", "1424d8", "144fd6", "14691d", "149d99",
+		"14bd61", "180373", "180f11", "182032", "183451", "186590", "188d0b", "18af61",
+		"18e7f4", "1c1ac0", "1c36bb", "1c9148", "1cab01", "2002af", "2056a7", "205ef0",
+		"20a2e4", "20c9d0", "2403b4", "28a03d", "28cfda", "28e02c", "28e7cf", "28f076",
+		"28ff3c", "2c200b", "2c61f6", "2cbe08", "303316", "3059b7", "3090ab", "30f7c5",
+		"3403de", "34363b", "34885d", "34ab37", "34e2fd", "362b1f", "380f4a", "38484c",
+		"38c986", "38ec0d", "3c07a9", "3c1596", "3c6c40", "3cbd3e", "3ce072", "404d7f",
+		"40a6d9", "40b395", "40bc60", "4400b1", "444c0c", "4464d4", "44d884", "4521c7",
+		"480b49", "483b38", "488db6", "48a91c", "48bf6b", "48d705", "4c3271", "4c57ca",
+		"4c74bf", "4cb199", "5014a6", "5055b1", "505dac", "507a55", "50bc96", "50de06",
+		"50ea5f", "54323d", "54501e", "54ae27", "54e43a", "54eaa8", "583b65", "58b035",
+		"5c0947", "5c95ae", "5c97f3", "5cf5da", "5cf7e6", "5cf938", "6001a8", "60334e",
+		"6093ec", "60c547", "60f445", "60f81d", "60facd", "60fec5", "61007b", "6476ba",
+		"64a3cb", "64b0a6", "64e682", "64fe28", "680949", "68253a", "6834eb", "684342",
+		"685b35", "68a86d", "68d93c", "68fef7", "6c19c0", "6c3e6d", "6c4008", "6c709a",
+		"6c72e7", "6c8dc5", "6c94f8", "6c96cf", "6caab8", "702b74", "70602b", "7081eb",
+		"709c8f", "70a2b3", "70cd60", "70dca2", "70dee2", "70e72c", "70ece4", "70f087",
+		"743a20", "7447ae", "7451ba", "748114", "748d08", "74e1b6", "74e2f5", "74e50b",
+		"780931", "781844", "783a84", "7853f2", "786C1c", "787e61", "788451", "789f70",
+		"78a3e4", "78ca39", "78d75f", "78e103", "78fd94", "7c0191", "7c04d0", "7c11be",
+		"7c5049", "7c6d62", "7c6df8", "7cc3a1", "7cc537", "7cf05f", "7cfadf", "80006e",
+		"80414e", "804971", "8058f8", "80618f", "80a6bb", "80b03d", "80be05", "80e650",
+		"80ea48", "80ed2c", "841310", "8441a9", "847771", "848047", "848e0c", "84a134",
+		"84b153", "84f03b", "84fcac", "8801a7", "880501", "8832e9", "886429", "886b44",
+		"8873be", "88817c", "88a2d7", "88c663", "88e87f", "8c006d", "8c2937", "8c2daa",
+		"8c3d79", "8c5877", "8c7aaa", "8c8590", "8c8ef2", "8caa61", "8cae4c", "8cce4e",
+		"8cdb25", "900953", "901b0e", "903c92", "9046b7", "904c4f", "90724b", "90840d",
+		"9098f0", "90a2da", "90b0ed", "90b21f", "90b931", "90c1c6", "90f278", "90fd61",
+		"941564", "943b1e", "944424", "948d50", "949686", "94bf2d", "94e96a", "94f6a3",
+		"9800c6", "98228d", "9824c2", "9825e2", "9844b8", "984b4a", "9859e0", "985aa9",
+		"986af3", "987f4e", "98835c", "989e63", "98b8e3", "98c5e9", "98ca33", "98d6bb",
+		"98e0d9", "98f0ab", "98fe94", "9c048d", "9c20d0", "9c207b", "9c293f", "9c358f",
+		"9c4fda", "9c5106", "9c6492", "9c84bf", "9cf387", "9cf48e", "9cff3d":
+		return "Apple"
+	// Samsung
+	case "0001d8", "001632", "0017c9", "001e98", "0024e9", "0025ab", "00263b", "0050f3",
+		"006f64", "0090d0", "00d0cb", "0414a8", "04fe31", "080037", "080d6c",
+		"082ae6", "0841bd", "0881bc", "08fc88", "0c2236", "0c2d89", "0c416a", "0c7155",
+		"0ce122", "1020b6", "1045be", "1077b1", "10a5d0", "10d3a8", "10e453", "1430e4",
+		"144d67", "1484b8", "1491af", "14a51b", "14cc20", "14f0c5", "1814eb", "182463",
+		"184e32", "188961", "18af2b", "18dc56", "1c23b9", "1c3ade", "1c4af7", "1c62dc":
+		return "Android"
+	// Huawei
+	case "00049f", "001882", "001e10", "00215c", "002361", "00259c", "0026bc", "0026c9",
+		"0046cf", "0049df", "0077e7", "00cc5a", "00e007", "00e0fc", "04036b":
+		return "Android"
+	// Xiaomi
+	case "001a7d", "040e3c", "08d833", "0ccb8d", "104fe4", "141553", "148352",
+		"149f3c", "180d32", "1c0499", "1c5cf2", "2016b9", "20a7db", "241b7a", "280728",
+		"28c7ce", "2c6fc7", "301ab7", "30c515", "344c0c", "349ee4", "34c731", "38e1d8",
+		"403ec7", "405edb", "40e57e", "44a5b6", "4842e3", "48e324", "4c8a9c", "502b73",
+		"50cda2", "54e061", "5820b1", "586938", "586ab0", "5c2e59", "5c4f09", "601a28",
+		"6411e7", "644d70", "6460e7", "64b392", "64c9f9", "680571", "681dcf", "68a378",
+		"68dfdd", "702c01", "70548a", "70a87b", "70bb58", "70fee6", "741e93", "74421e",
+		"74b00c", "780d4c", "7830e2", "7831c1", "78471d", "788ec8", "78bcc4", "78d9c9",
+		"7c1c4e", "7c8988", "8032b9", "804c6c", "806d77", "808a81", "8091cf":
+		return "IoT"
+	// Microsoft
+	case "0003ff", "00125a", "0012d3", "001320", "0014a5", "00155d", "00172f", "0017fa",
+		"0019b5", "001b40", "001b78", "001bfc", "001d09", "001d72", "0021a7":
+		return "Windows"
+	// Intel (many Windows PCs)
+	case "00016c", "00166f", "0018de", "001b21", "001b77", "001cbf", "001de0",
+		"001e64", "001e65", "001e67", "001ec0", "001f3b", "002163", "002275", "0023c6",
+		"002412", "002427", "002570", "002655", "0026c6", "0026cf", "002713":
+		return "Windows"
+	// Google
+	case "001a11", "001d7e", "00237e", "002415", "044a20", "080026", "08c5e1", "0c0e76",
+		"105eb6", "1415b2", "143ee4", "1881e2", "1c659d", "242725", "244451", "2476c9",
+		"28c678", "2c4c8c", "305d51", "349108", "38aa5d", "38ca73", "40b4cd",
+		"4425bb", "485a3f", "54e4bd", "5859f0", "5c7b9d", "5ce623", "601431", "608f5c",
+		"688b87", "6c2995", "6cbb18", "704529", "707c18", "74546c", "7824af":
+		return "Android"
+	}
+	return ""
 }
 
 func detectType(hostname, vendorClass string) string {
 	h := strings.ToLower(hostname)
 	v := strings.ToLower(vendorClass)
-	for _, kw := range []string{"iphone", "ipad", "apple", "macbook"} {
+	if h == "" {
+		return "Unknown"
+	}
+	for _, kw := range []string{"iphone", "ipad", "apple", "macbook", "imac"} {
 		if strings.Contains(h, kw) || strings.Contains(v, kw) {
 			return "Apple"
 		}
 	}
-	for _, kw := range []string{"android", "pixel", "samsung"} {
+	for _, kw := range []string{"android", "pixel", "samsung", "sgt-", "oneplus", "redmi", "xiaomi"} {
 		if strings.Contains(h, kw) || strings.Contains(v, kw) {
 			return "Android"
 		}
 	}
-	if strings.Contains(h, "desktop-") || strings.Contains(h, "compil") || strings.Contains(h, "windows") {
+	if strings.Contains(h, "desktop") || strings.Contains(h, "compil") || strings.Contains(h, "windows") || strings.Contains(h, "pc-") {
 		return "Windows"
 	}
-	if strings.Contains(h, "ubuntu") || strings.Contains(h, "raspberry") || strings.Contains(h, "openwrt") || strings.Contains(v, "dhcpcd-") {
+	if strings.Contains(h, "ubuntu") || strings.Contains(h, "debian") || strings.Contains(h, "raspberry") || strings.Contains(h, "openwrt") || strings.Contains(v, "dhcpcd-") {
 		return "Linux"
 	}
-	for _, kw := range []string{"xiaomi", "lumi", "esp", "sonoff", "tasmota"} {
+	for _, kw := range []string{"lumi", "gateway", "midea", "esp", "sonoff", "tasmota", "ipcamera", "camera", "wlan"} {
 		if strings.Contains(h, kw) || strings.Contains(v, kw) {
 			return "IoT"
 		}
+	}
+	// Tmall, tmall-genie
+	if strings.Contains(h, "tmall") || strings.Contains(h, "天猫") {
+		return "IoT"
 	}
 	return "Unknown"
 }
@@ -363,23 +505,38 @@ func speedLoop() {
 		time.Sleep(3 * time.Second)
 		now := time.Now().Unix()
 		out, _ := exec.Command("conntrack", "-L").Output()
-		cur := map[string]uint64{}
-		var ip string
+		curOut := map[string]uint64{}
+		curIn := map[string]uint64{}
 		for _, line := range strings.Split(string(out), "\n") {
-			if strings.Contains(line, "src=") {
-				ip = field(line, "src=")
+			if !strings.Contains(line, "bytes=") {
+				continue
 			}
-			if strings.Contains(line, "bytes=") && ip != "" {
-				bs := field(line, "bytes=")
-				n, _ := atoui(bs)
-				if isLAN(ip) && ip != "127.0.0.1" {
-					cur[ip] += n
-				}
+			// Format: src=LANIP dst=WANIP ... bytes=OUT ... src=WANIP dst=LANIP ... bytes=IN
+			idx := strings.Index(line, " src=")
+			if idx < 0 {
+				continue
+			}
+			src1 := strings.SplitN(line[idx+5:], " ", 2)[0]
+			// Find first and last bytes=
+			firstBytes := strings.Index(line, "bytes=")
+			lastBytes := strings.LastIndex(line, "bytes=")
+			var outBytes, inBytes uint64
+			if firstBytes >= 0 {
+				bs := strings.SplitN(line[firstBytes+6:], " ", 2)[0]
+				outBytes, _ = atoui(bs)
+			}
+			if lastBytes > firstBytes {
+				bs := strings.SplitN(line[lastBytes+6:], " ", 2)[0]
+				inBytes, _ = atoui(bs)
+			}
+			if isLAN(src1) && src1 != "127.0.0.1" {
+				curOut[src1] += outBytes
+				curIn[src1] += inBytes
 			}
 		}
 		speedMu.Lock()
 		mu.Lock()
-		for ip, total := range cur {
+		for ip, total := range curOut {
 			prev, ok := prevBytes[ip]
 			prevBytes[ip] = total
 			if !firstSeen[ip] {
@@ -393,6 +550,23 @@ func speedLoop() {
 			speed := uint64(float64(delta) / 3.0 * 8)
 			if speed > 0 {
 				db.Exec("INSERT INTO traffic (device_id,speed_out,recorded_at) SELECT id,?,? FROM devices WHERE ipv4=? AND ipv4!=''", speed, now, ip)
+			}
+		}
+		for ip, total := range curIn {
+			key := "in:" + ip
+			prev, ok := prevBytes[key]
+			prevBytes[key] = total
+			if !firstSeen[key] {
+				firstSeen[key] = true
+				continue
+			}
+			if !ok {
+				continue
+			}
+			delta := total - prev
+			speed := uint64(float64(delta) / 3.0 * 8)
+			if speed > 0 {
+				db.Exec("INSERT INTO traffic (device_id,speed_in,recorded_at) SELECT id,?,? FROM devices WHERE ipv4=? AND ipv4!=''", speed, now, ip)
 			}
 		}
 		mu.Unlock()
@@ -457,6 +631,7 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 		rows.Scan(&d.ID, &d.Alias, &d.Hostname, &d.DeviceType, &d.CurrentIP, &d.CurrentMAC, &b, &d.RateLimit, &d.LastSeen, &d.Online, &d.NumMACs)
 		d.IsBlocked = b == 1
 		db.QueryRow("SELECT COALESCE(speed_out,0) FROM traffic WHERE device_id=? ORDER BY recorded_at DESC LIMIT 1", d.ID).Scan(&d.SpeedOut)
+		db.QueryRow("SELECT COALESCE(speed_in,0) FROM traffic WHERE device_id=? ORDER BY recorded_at DESC LIMIT 1", d.ID).Scan(&d.SpeedIn)
 		devs = append(devs, d)
 	}
 	json.NewEncoder(w).Encode(devs)
@@ -523,13 +698,66 @@ func getMAC(ip string) string {
 	return ""
 }
 
-func getHostname(ip string) string {
-	out, _ := exec.Command("sh", "-c", "cat /tmp/hosts/dhcp.* /tmp/hosts/odhcpd.hosts.lan 2>/dev/null | grep '^"+ip+"[\t ]' | head -1").Output()
+func searchHostnameByIP(ip string) string {
+	// Search all lease files for this IP and return the hostname
+	out, _ := exec.Command("sh", "-c", "cat /tmp/hosts/dhcp.* /tmp/hosts/odhcpd.hosts.lan 2>/dev/null | grep '"+ip+"[\t ]' | head -1").Output()
 	f := strings.Fields(string(out))
 	if len(f) >= 2 {
 		return f[1]
 	}
 	return ""
+}
+
+func getHostname(ip string) string {
+	out, _ := exec.Command("sh", "-c", "cat /tmp/hosts/dhcp.* /tmp/hosts/odhcpd.hosts.lan /etc/dhcp.leases 2>/dev/null | grep '"+ip+"' | head -1").Output()
+	f := strings.Fields(string(out))
+	if len(f) >= 4 && f[2] == ip {
+		return f[3]
+	}
+	if len(f) >= 2 && f[0] == ip {
+		return f[1]
+	}
+	return ""
+}
+
+func mergeDuplicateHostnames() {
+	// Only merge if DHCP fingerprint matches (vendor_class + opt55_hash)
+	// Same hostname alone is NOT enough — different devices can share hostnames
+	rows, _ := db.Query(`SELECT d1.id, d2.id, d1.hostname, d1.mac, d2.mac, d1.ipv4, d2.ipv4
+		FROM devices d1 JOIN devices d2 ON d1.hostname=d2.hostname AND d1.id<d2.id
+		WHERE d1.hostname!='' AND d1.vendor_class!='' AND d1.opt55_hash!=''
+		AND d1.vendor_class=d2.vendor_class AND d1.opt55_hash=d2.opt55_hash`)
+	if rows == nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id1, id2 int64
+		var hostname, mac1, mac2, ip1, ip2 string
+		rows.Scan(&id1, &id2, &hostname, &mac1, &mac2, &ip1, &ip2)
+
+		// Keep the one with fixed MAC, delete the random one
+		keepID, rmID := id1, id2
+		if isRandomMAC(mac1) && !isRandomMAC(mac2) {
+			keepID, rmID = id2, id1
+		}
+
+		db.Exec("UPDATE devices SET ipv4=CASE WHEN ipv4='' THEN ? ELSE ipv4 END WHERE id=?", ip2, keepID)
+		db.Exec("UPDATE device_macs SET device_id=? WHERE device_id=?", keepID, rmID)
+		db.Exec("DELETE FROM devices WHERE id=?", rmID)
+		log.Printf("Fingerprint-merged %s: %d → %d", hostname, rmID, keepID)
+	}
+}
+
+func isRandomMAC(mac string) bool {
+	if len(mac) < 2 {
+		return false
+	}
+	b, err := hexToByte(mac[:2])
+	if err != nil {
+		return false
+	}
+	return b&0x2 != 0
 }
 
 func hashOpt55(s string) string {
@@ -562,6 +790,24 @@ func isLAN(ipStr string) bool {
 	return len(ip) == net.IPv6len &&
 		((ip[0]&0xfe) == 0xfc ||
 			(ip[0] == 0xfe && ip[1]&0xc0 == 0x80))
+}
+
+func hexToByte(s string) (byte, error) {
+	var b byte
+	for i, c := range s {
+		b *= 16
+		switch {
+		case c >= '0' && c <= '9':
+			b += byte(c - '0')
+		case c >= 'a' && c <= 'f':
+			b += byte(c - 'a' + 10)
+		case c >= 'A' && c <= 'F':
+			b += byte(c - 'A' + 10)
+		default:
+			return 0, fmt.Errorf("bad hex char %c at pos %d", c, i)
+		}
+	}
+	return b, nil
 }
 
 func atoui(s string) (uint64, error) {
