@@ -752,8 +752,13 @@ func calcSpeed() {
 			spPrevDown[ip] = curDown[ip]
 			continue
 		}
-		up := uint64(float64(curUp[ip]-spPrevUp[ip]) / interval * 8)
-		dn := uint64(float64(curDown[ip]-spPrevDown[ip]) / interval * 8)
+		var up, dn uint64
+		if curUp[ip] > spPrevUp[ip] {
+			up = uint64(float64(curUp[ip]-spPrevUp[ip]) / interval * 8)
+		}
+		if curDown[ip] > spPrevDown[ip] {
+			dn = uint64(float64(curDown[ip]-spPrevDown[ip]) / interval * 8)
+		}
 		spPrevUp[ip] = curUp[ip]
 		spPrevDown[ip] = curDown[ip]
 		if up > 0 || dn > 0 {
@@ -799,7 +804,9 @@ func reconcileLoop() {
 				var b, r, rd int
 				rows.Scan(&id, &ip, &b, &r, &rd)
 				if r > 0 {
-					exec.Command(scriptDir+"/limit.sh", "set", fmt.Sprintf("%d", id), ip, fmt.Sprintf("%d", r)).Run()
+					kbps := r / 1000
+					if kbps < 1 { kbps = 1 }
+					exec.Command(scriptDir+"/limit.sh", "set", fmt.Sprintf("%d", id), ip, fmt.Sprintf("%d", kbps)).Run()
 				} else {
 					exec.Command(scriptDir+"/limit.sh", "del", fmt.Sprintf("%d", id), ip, "0").Run()
 				}
@@ -874,6 +881,7 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 		Alias       string `json:"alias"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+	log.Printf("LIMIT: id=%d rate=%d ratedn=%d alias=%s", req.DeviceID, req.RateLimit, req.RateLimitDn, req.Alias)
 	if req.Alias != "" {
 		db.Exec("UPDATE devices SET alias=? WHERE id=?", req.Alias, req.DeviceID)
 	}
