@@ -706,7 +706,7 @@ func detectType(hostname, vendorClass string) string {
 	if strings.Contains(h, "ubuntu") || strings.Contains(h, "debian") || strings.Contains(h, "raspberry") || strings.Contains(h, "openwrt") || strings.Contains(v, "dhcpcd-") {
 		return "Linux"
 	}
-	for _, kw := range []string{"lumi", "gateway", "midea", "esp", "sonoff", "tasmota", "ipcamera", "camera", "wlan"} {
+	for _, kw := range []string{"lumi", "gateway", "midea", "esp", "sonoff", "tasmota", "ipcamera", "camera", "wlan", "bouffalolab"} {
 		if strings.Contains(h, kw) || strings.Contains(v, kw) {
 			return "IoT"
 		}
