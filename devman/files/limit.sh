@@ -1,28 +1,29 @@
 #!/bin/sh
-# nftables-based rate limiting (no kernel module dependency)
-CID=$2
-IP=$3
-RATE=${4:-0}
-
+# tc htb rate limiting for devman
+CID=$2; IP=$3; RATE=${4:-0}; IF=br-lan
 case "$1" in
-  init)
-    nft add table ip devman 2>/dev/null
-    nft add chain ip devman limit_in { type filter hook forward priority filter - 1; } 2>/dev/null
-    nft add chain ip devman limit_out { type filter hook forward priority filter - 1; } 2>/dev/null
-    ;;
+  init) tc qdisc add dev $IF root handle 1: htb default 30 ;;
   set)
-    # Remove old rules for this IP
-    nft delete rule ip devman limit_in handle $(nft -a list chain ip devman limit_in 2>/dev/null | grep "$IP " | grep -o "handle [0-9]*" | cut -d' ' -f2) 2>/dev/null
-    # Add new limit: rate in kbps → translate to byte rate
-    # nft limit syntax: limit rate X bytes/second
-    # Kbps to bytes/s: * 1000 / 8 = * 125
-    LIMIT=$((RATE * 125))
-    nft add rule ip devman limit_in ip saddr $IP limit rate $LIMIT bytes/second drop 2>/dev/null
+    tc filter del dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID
+    tc class del dev $IF parent 1: classid 1:$CID
+    tc class add dev $IF parent 1: classid 1:$CID htb rate ${RATE}kbit ceil ${RATE}kbit
+    tc filter add dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID
     ;;
   del)
-    nft delete rule ip devman limit_in handle $(nft -a list chain ip devman limit_in 2>/dev/null | grep "$IP " | grep -o "handle [0-9]*" | cut -d' ' -f2) 2>/dev/null
+    tc filter del dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID
+    tc class del dev $IF parent 1: classid 1:$CID
     ;;
-  clean)
-    nft flush chain ip devman limit_in 2>/dev/null
+  setdn)
+    DNID="1${CID}"
+    tc filter del dev $IF parent 1: prio 1 u32 match ip dst $IP flowid 1:$DNID
+    tc class del dev $IF parent 1: classid 1:$DNID
+    tc class add dev $IF parent 1: classid 1:$DNID htb rate ${RATE}kbit ceil ${RATE}kbit
+    tc filter add dev $IF parent 1: prio 1 u32 match ip dst $IP flowid 1:$DNID
     ;;
+  deldn)
+    DNID="1${CID}"
+    tc filter del dev $IF parent 1: prio 1 u32 match ip dst $IP flowid 1:$DNID
+    tc class del dev $IF parent 1: classid 1:$DNID
+    ;;
+  clean) tc qdisc del dev $IF root ;;
 esac

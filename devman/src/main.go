@@ -810,6 +810,15 @@ func reconcileLoop() {
 				} else {
 					exec.Command(scriptDir+"/limit.sh", "del", fmt.Sprintf("%d", id), ip, "0").Run()
 				}
+				// Download rate limiting
+				if rd > 0 {
+					log.Printf("RATE_DN: id=%d ip=%s kbps=%.2f", id, ip, float64(rd)/1000)
+					kbps := rd / 1000
+					if kbps < 1 { kbps = 1 }
+					exec.Command(scriptDir+"/limit.sh", "setdn", fmt.Sprintf("%d", id), ip, fmt.Sprintf("%d", kbps)).Run()
+				} else {
+					exec.Command(scriptDir+"/limit.sh", "deldn", fmt.Sprintf("%d", id), ip, "0").Run()
+				}
 			}
 			rows.Close()
 		}

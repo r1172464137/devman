@@ -52,7 +52,7 @@ html[data-darkmode=true] .dm-empty{color:#666}
 </div>
 <script>
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function fmtSpeed(bps){if(!bps)return'0 bps';if(bps>=1e6)return(bps/1e6).toFixed(1)+' Mbps';if(bps>=1e3)return(bps/1e3).toFixed(1)+' Kbps';return bps+' bps'}
+function fmtSpeed(bps){if(!bps||bps>1e12)return'0';if(bps>=1e9)return(bps/1e9).toFixed(2)+' Gbps';if(bps>=1e6)return(bps/1e6).toFixed(1)+' Mbps';if(bps>=1e3)return(bps/1e3).toFixed(0)+' Kbps';return bps+' bps'}
 function status(s){
  if(s==='green')return'<span class="dm-on">● Online</span>';
  if(s==='yellow')return'<span class="dm-yellow">◐ Maybe</span>';
@@ -72,7 +72,8 @@ function load(){
    h+='<td class="dm-mac">'+esc(dev.current_mac||'-')+'</td>';
    h+='<td>'+status(dev.online)+'</td>';
    h+='<td class="dm-speed">↑'+fmtSpeed(dev.speed_in||0)+' ↓'+fmtSpeed(dev.speed_out||0)+'</td>';
-   h+='<td>'+(dev.is_blocked?'<span class="dm-blocked">■</span>':'')+'</td>';
+   var lim=(dev.rate_limit||dev.rate_limit_down)?' <span style="color:#f90;font-weight:700" title="Limited">⚡</span>':'';
+   h+='<td>'+(dev.is_blocked?'<span class="dm-blocked">■</span>':'')+lim+'</td>';
    h+='<td>';
    h+=dev.is_blocked?'<button class="dm-btn dm-btn-unblock" onclick="tb('+dev.id+',0)">Unblock</button>':'<button class="dm-btn dm-btn-block" onclick="tb('+dev.id+',1)">Block</button>';
    h+=' <button class="dm-btn dm-btn-rename" onclick="rn('+dev.id+',\''+esc(name)+'\')">Rename</button>';
@@ -87,11 +88,13 @@ function tb(id,b){fetch('/cgi-bin/luci/admin/network/devman/api_block?device_id=
 function showLimitModal(id,rateLimit){
  var m=document.createElement('div');m.className='dm-modal';
  var upVal=rateLimit||0,dnVal=0;
- m.innerHTML='<div class="dm-modal-box"><h3>Bandwidth Limit</h3><label>Upload (kbps, 0=unlimited):</label><input id="dm-up" type="number" min="0" value="'+upVal+'"><label>Download (kbps, 0=unlimited):</label><input id="dm-dn" type="number" min="0" value="'+dnVal+'"><div class="dm-modal-btns"><button class="dm-btn-cancel" onclick="this.closest(\'.dm-modal\').remove()">Cancel</button><button class="dm-btn-save" id="dm-ok">Apply</button></div></div>';
+ var unit=kbpsToUnit(upVal);
+ var upShow=unit?upVal/unit[1]:0;
+ m.innerHTML='<div class="dm-modal-box"><h3>Bandwidth Limit</h3><div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><label style="flex:1">Upload</label><input id="dm-up" type="number" min="0" step="0.1" value="'+upShow.toFixed(1)+'" style="flex:1"><select id="dm-up-unit" style="width:80px"><option value="1000000000">Gbps</option><option value="1000000" selected>Mbps</option><option value="1000">Kbps</option></select></div><div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><label style="flex:1">Download</label><input id="dm-dn" type="number" min="0" step="0.1" value="0" style="flex:1"><select id="dm-dn-unit" style="width:80px"><option value="1000000000">Gbps</option><option value="1000000" selected>Mbps</option><option value="1000">Kbps</option></select></div><div class="dm-modal-btns"><button class="dm-btn-cancel" onclick="this.closest(\'.dm-modal\').remove()">Cancel</button><button class="dm-btn-save">Apply</button></div></div>';
  document.body.appendChild(m);
  m.querySelector('.dm-btn-save').onclick=function(){
-  var up=parseInt(m.querySelector('#dm-up').value)||0;
-  var dn=parseInt(m.querySelector('#dm-dn').value)||0;
+  var up=Math.round(parseFloat(m.querySelector('#dm-up').value)*parseInt(m.querySelector('#dm-up-unit').value))||0;
+  var dn=Math.round(parseFloat(m.querySelector('#dm-dn').value)*parseInt(m.querySelector('#dm-dn-unit').value))||0;
   m.remove();
   fetch('/cgi-bin/luci/admin/network/devman/api_limit?device_id='+id+'&rate_limit='+up+'&rate_limit_down='+dn).then(load);
  };
@@ -99,6 +102,7 @@ function showLimitModal(id,rateLimit){
  m.querySelector('#dm-up').onkeydown=function(e){if(e.key==='Enter')m.querySelector('#dm-dn').focus()};
  m.querySelector('#dm-dn').onkeydown=function(e){if(e.key==='Enter')m.querySelector('.dm-btn-save').click()};
 }
+function kbpsToUnit(bps){if(!bps)return null;if(bps>=1e9)return ['Gbps',1e9];if(bps>=1e6)return ['Mbps',1e6];if(bps>=1e3)return ['Kbps',1e3];return ['bps',1]}
 function rn(id,n){
  var m=document.createElement('div');m.className='dm-modal';
  m.innerHTML='<div class="dm-modal-box"><h3>Rename</h3><input id="dm-rn" value="'+esc(n||'')+'"><div class="dm-modal-btns"><button class="dm-btn-cancel" onclick="this.closest(\'.dm-modal\').remove()">Cancel</button><button class="dm-btn-save" id="dm-ok">OK</button></div></div>';
