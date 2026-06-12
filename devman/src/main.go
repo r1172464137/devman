@@ -41,9 +41,10 @@ type DeviceProfile struct {
 }
 
 var (
-	db        *sql.DB
-	mu        sync.RWMutex
-	lanIface  = "br-lan"
+	db          *sql.DB
+	mu          sync.RWMutex
+	limitMu     sync.Mutex
+	lanIface    = "br-lan"
 )
 
 func nftInit() {
@@ -100,6 +101,8 @@ func tcLazyInit() {
 }
 
 func nftSetLimit(ip string, ulBps, dlBps int) {
+	limitMu.Lock()
+	defer limitMu.Unlock()
 	tcLazyInit()
 	prio := int(hashIp(ip))
 
@@ -113,14 +116,14 @@ func nftSetLimit(ip string, ulBps, dlBps int) {
 			"htb", "rate", fmt.Sprintf("%d", ulKbps)+"kbit", "ceil", fmt.Sprintf("%d", ulKbps)+"kbit", "burst", "15k", "cburst", "15k").Run()
 		exec.Command("tc", "class", "change", "dev", "ifb0", "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio),
 			"htb", "rate", fmt.Sprintf("%d", ulKbps)+"kbit", "ceil", fmt.Sprintf("%d", ulKbps)+"kbit", "burst", "15k", "cburst", "15k").Run()
-		// eqosplus dual match: fw + u32 ip src on parent 1:0
+		// eqosplus dual match: u32 ip src on parent 1:0
 		exec.Command("tc", "filter", "add", "dev", "ifb0", "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
-			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "src", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
+			"protocol", "ip", "u32", "match", "ip", "src", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
 		exec.Command("tc", "filter", "replace", "dev", "ifb0", "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
-			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "src", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
+			"protocol", "ip", "u32", "match", "ip", "src", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
 	} else {
 		exec.Command("tc", "filter", "del", "dev", "ifb0", "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
-			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "src", ip).Run()
+			"protocol", "ip", "u32", "match", "ip", "src", ip).Run()
 		exec.Command("tc", "class", "del", "dev", "ifb0", "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio)).Run()
 	}
 
@@ -135,12 +138,12 @@ func nftSetLimit(ip string, ulBps, dlBps int) {
 		exec.Command("tc", "class", "change", "dev", lanIface, "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio),
 			"htb", "rate", fmt.Sprintf("%d", dlKbps)+"kbit", "ceil", fmt.Sprintf("%d", dlKbps)+"kbit", "burst", "15k", "cburst", "15k").Run()
 		exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
-			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "dst", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
+			"protocol", "ip", "u32", "match", "ip", "dst", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
 		exec.Command("tc", "filter", "replace", "dev", lanIface, "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
-			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "dst", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
+			"protocol", "ip", "u32", "match", "ip", "dst", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
 	} else {
 		exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
-			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "dst", ip).Run()
+			"protocol", "ip", "u32", "match", "ip", "dst", ip).Run()
 		exec.Command("tc", "class", "del", "dev", lanIface, "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio)).Run()
 	}
 }
@@ -944,7 +947,7 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 	if ip != "" {
 		var ul, dl int
 		db.QueryRow("SELECT COALESCE(rate_limit,0), COALESCE(rate_limit_dn,0) FROM devices WHERE id=?", req.DeviceID).Scan(&ul, &dl)
-		nftSetLimit(ip, ul, dl)
+		go nftSetLimit(ip, ul, dl)
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
