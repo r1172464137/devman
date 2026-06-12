@@ -1,8 +1,8 @@
 <%+header%>
 <style>
 .dm-wrap{padding:16px}
-.dm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
-.dm-card{background:#fff;border-radius:10px;padding:16px;box-shadow:0 1px 4px rgba(0,0,0,.08);border:1px solid #e8e8e8;position:relative;transition:box-shadow .2s}
+.dm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.dm-card{background:#fff;border-radius:10px;padding:20px 16px;box-shadow:0 1px 4px rgba(0,0,0,.08);border:1px solid #e8e8e8;position:relative;transition:box-shadow .2s}
 .dm-card:hover{box-shadow:0 2px 12px rgba(0,0,0,.12)}
 .dm-card-top{display:flex;align-items:center;gap:6px;margin-bottom:10px;flex-wrap:nowrap;overflow:hidden}
 .dm-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
@@ -56,9 +56,9 @@ html[data-darkmode=true] .dm-modal input{background:#333;border-color:#555;color
 html[data-darkmode=true] .dm-btn-cancel{background:#444;color:#ccc}
 </style>
 <div class="dm-wrap">
-<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
 <h2 style="margin:0">设备管理</h2>
-<select id="dm-interval" onchange="changeRefresh(this.value)" style="padding:3px 8px;border-radius:4px;border:1px solid #d0d0d0;font-size:13px">
+<select id="dm-interval" onchange="changeRefresh(this.value)" style="padding:3px 6px;border-radius:4px;border:1px solid #d0d0d0;font-size:12px;width:60px">
 <option value="5000" selected>5秒</option><option value="15000">15秒</option><option value="30000">30秒</option>
 </select></div>
 <div id="dm-content"><p class="dm-empty">Loading...</p></div>
@@ -161,6 +161,5 @@ function changeRefresh(val){
  dmTimer=setInterval(load,parseInt(val));
 }
 load();
-document.querySelector('h2').textContent='Device Manager v6.7';
 </script>
 <%+footer%>
