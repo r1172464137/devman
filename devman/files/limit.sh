@@ -8,10 +8,10 @@ case "$1" in
     ;;
   set)
     # Upload: police on ingress (before NAT, src IP still correct)
-    tc filter replace dev $IF parent ffff: prio $CID u32 match ip src $IP police rate ${RATE}kbit burst 10k drop 2>/dev/null
+    tc filter del dev $IF parent ffff: prio $CID 2>/dev/null
+    tc filter add dev $IF parent ffff: prio $CID u32 match ip src $IP police rate ${RATE}kbit burst 10k drop 2>/dev/null
     ;;
   del)
-    tc filter del dev $IF parent ffff: prio $CID u32 match ip src $IP 2>/dev/null
     tc filter del dev $IF parent ffff: prio $CID 2>/dev/null
     ;;
   setdn)
