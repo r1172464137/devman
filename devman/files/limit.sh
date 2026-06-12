@@ -7,12 +7,17 @@ case "$1" in
     tc qdisc add dev $IF handle ffff: ingress 2>/dev/null
     ;;
   set)
-    # Upload: police on ingress (before NAT, src IP still correct)
+    # Upload: police on ingress, but LAN traffic passes through
     tc filter del dev $IF parent ffff: prio $CID 2>/dev/null
-    tc filter add dev $IF parent ffff: prio $CID u32 match ip src $IP police rate ${RATE}kbit burst 10k drop 2>/dev/null
+    tc filter del dev $IF parent ffff: prio 1$CID 2>/dev/null
+    # LAN traffic (dst 192.168.0.0/16) → pass, no limit
+    tc filter add dev $IF parent ffff: prio $CID u32 match ip src $IP match ip dst 192.168.0.0/16 action pass 2>/dev/null
+    # WAN traffic → police
+    tc filter add dev $IF parent ffff: prio 1$CID u32 match ip src $IP police rate ${RATE}kbit burst 10k drop 2>/dev/null
     ;;
   del)
     tc filter del dev $IF parent ffff: prio $CID 2>/dev/null
+    tc filter del dev $IF parent ffff: prio 1$CID 2>/dev/null
     ;;
   setdn)
     # Download: htb egress on dst IP
