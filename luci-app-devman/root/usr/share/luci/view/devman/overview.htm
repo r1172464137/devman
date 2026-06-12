@@ -1,7 +1,7 @@
 <%+header%>
 <style>
-.dm-wrap{padding:16px}
-.dm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.dm-wrap{padding:20px}
+.dm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;padding-top:8px}
 .dm-card{background:#fff;border-radius:10px;padding:20px 16px;box-shadow:0 1px 4px rgba(0,0,0,.08);border:1px solid #e8e8e8;position:relative;transition:box-shadow .2s}
 .dm-card:hover{box-shadow:0 2px 12px rgba(0,0,0,.12)}
 .dm-card-top{display:flex;align-items:center;gap:6px;margin-bottom:10px;flex-wrap:nowrap;overflow:hidden}
@@ -56,7 +56,7 @@ html[data-darkmode=true] .dm-modal input{background:#333;border-color:#555;color
 html[data-darkmode=true] .dm-btn-cancel{background:#444;color:#ccc}
 </style>
 <div class="dm-wrap">
-<div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:28px">
 <h2 style="margin:0">设备管理</h2>
 <select id="dm-interval" onchange="changeRefresh(this.value)" style="padding:3px 6px;border-radius:4px;border:1px solid #d0d0d0;font-size:12px;width:60px">
 <option value="5000" selected>5秒</option><option value="15000">15秒</option><option value="30000">30秒</option>
@@ -81,7 +81,7 @@ function dot(s){
  return'<div class="dm-dot dm-dot-gray" title="Offline"></div>';
 }
 function load(){
- fetch('/cgi-bin/luci/admin/network/devman/api_devices').then(r=>r.json()).then(function(d){
+ fetch('/cgi-bin/luci/admin/devman/api_devices').then(r=>r.json()).then(function(d){
   var c=document.getElementById('dm-content');
   if(!d||!d.length){c.innerHTML='<p class="dm-empty">暂无设备</p>';return}
   var known=[],unknown=[];
@@ -117,7 +117,7 @@ function load(){
   c.innerHTML=h;
  });
 }
-function tb(id,b){fetch('/cgi-bin/luci/admin/network/devman/api_block?device_id='+id+'&block='+b).then(load)}
+function tb(id,b){fetch('/cgi-bin/luci/admin/devman/api_block?device_id='+id+'&block='+b).then(load)}
 function showLimitModal(id,rateUp,rateDn){
  var m=document.createElement('div');m.className='dm-modal';
  var upVal=rateUp||0,dnVal=rateDn||0;
@@ -130,7 +130,7 @@ function showLimitModal(id,rateUp,rateDn){
   var up=Math.round(parseFloat(m.querySelector('#dm-up').value)*parseInt(m.querySelector('#dm-up-unit').value))||0;
   var dn=Math.round(parseFloat(m.querySelector('#dm-dn').value)*parseInt(m.querySelector('#dm-dn-unit').value))||0;
   m.remove();
-  fetch('/cgi-bin/luci/admin/network/devman/api_limit?device_id='+id+'&rate_limit='+up+'&rate_limit_down='+dn).then(load);
+  fetch('/cgi-bin/luci/admin/devman/api_limit?device_id='+id+'&rate_limit='+up+'&rate_limit_down='+dn).then(load);
  };
  m.querySelector('#dm-up').focus();
  m.querySelector('#dm-up').onkeydown=function(e){if(e.key==='Enter')m.querySelector('#dm-dn').focus()};
@@ -144,7 +144,7 @@ function rn(id,n){
  m.querySelector('.dm-btn-save').onclick=function(){
   var v=m.querySelector('#dm-rn').value;
   m.remove();
-  if(v&&v!==n)fetch('/cgi-bin/luci/admin/network/devman/api_limit?device_id='+id+'&rate_limit=-1&alias='+encodeURIComponent(v)).then(load);
+  if(v&&v!==n)fetch('/cgi-bin/luci/admin/devman/api_limit?device_id='+id+'&rate_limit=-1&alias='+encodeURIComponent(v)).then(load);
  };
  m.querySelector('#dm-rn').focus();
  m.querySelector('#dm-rn').onkeydown=function(e){if(e.key==='Enter')m.querySelector('.dm-btn-save').click()};

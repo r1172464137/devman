@@ -1,7 +1,7 @@
 {
-	"admin/network/devman": {
-		"title": "Device Manager",
-		"order": 50,
+	"admin/devman": {
+		"title": "设备管理",
+		"order": 15,
 		"action": {
 			"type": "view",
 			"path": "devman/overview"
