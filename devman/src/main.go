@@ -47,15 +47,20 @@ var (
 )
 
 func nftInit() {
+	// Block
 	exec.Command("nft", "add", "table", "ip", "devman").Run()
 	exec.Command("nft", "add", "set", "ip", "devman", "blocked_ip", "{", "type", "ipv4_addr", ";", "}").Run()
 	exec.Command("nft", "add", "chain", "ip", "devman", "forward", "{", "type", "filter", "hook", "forward", "priority", "filter", "-", "1", ";", "}").Run()
 	exec.Command("nft", "add", "rule", "ip", "devman", "forward", "ip", "saddr", "@blocked_ip", "drop").Run()
-	// Mark sets (TC infra created lazily on first limit)
+	// Rate limit: eqosplus pattern - nft marks + tc dual match
 	exec.Command("nft", "add", "set", "ip", "devman", "ul_mark", "{", "type", "ipv4_addr", ";", "}").Run()
 	exec.Command("nft", "add", "set", "ip", "devman", "dl_mark", "{", "type", "ipv4_addr", ";", "}").Run()
 	exec.Command("nft", "add", "rule", "ip", "devman", "forward", "ip", "saddr", "@ul_mark", "meta", "mark", "set", "0x80000000").Run()
 	exec.Command("nft", "add", "rule", "ip", "devman", "forward", "ip", "daddr", "@dl_mark", "meta", "mark", "set", "0x40000000").Run()
+	// postrouting - ensures mark survives all NAT/routing
+	exec.Command("nft", "add", "chain", "ip", "devman", "post", "{", "type", "filter", "hook", "postrouting", "priority", "filter", "-", "2", ";", "}").Run()
+	exec.Command("nft", "add", "rule", "ip", "devman", "post", "ip", "saddr", "@ul_mark", "meta", "mark", "set", "0x80000000").Run()
+	exec.Command("nft", "add", "rule", "ip", "devman", "post", "ip", "daddr", "@dl_mark", "meta", "mark", "set", "0x40000000").Run()
 }
 
 func nftBlock(ip string)   { exec.Command("nft", "add", "element", "ip", "devman", "blocked_ip", "{", ip, "}").Run() }
@@ -82,49 +87,61 @@ func tcLazyInit() {
 	exec.Command("modprobe", "sch_htb", "act_mirred", "ifb").Run()
 	exec.Command("ip", "link", "add", "dev", "ifb0", "type", "ifb").Run()
 	exec.Command("ip", "link", "set", "dev", "ifb0", "up").Run()
-	exec.Command("tc", "qdisc", "add", "dev", lanIface, "root", "handle", "1:", "htb", "default", "99").Run()
-	exec.Command("tc", "class", "add", "dev", lanIface, "parent", "1:", "classid", "1:99", "htb", "rate", "1000mbit", "ceil", "1000mbit").Run()
-	exec.Command("tc", "qdisc", "add", "dev", "ifb0", "root", "handle", "1:", "htb", "default", "99").Run()
-	exec.Command("tc", "class", "add", "dev", "ifb0", "parent", "1:", "classid", "1:99", "htb", "rate", "1000mbit", "ceil", "1000mbit").Run()
+	// br-lan: 1:0 root → 1:1 ref class (1000mbit) → per-device classes under 1:1
+	exec.Command("tc", "qdisc", "add", "dev", lanIface, "root", "handle", "1:0", "htb", "default", "1").Run()
+	exec.Command("tc", "class", "add", "dev", lanIface, "parent", "1:0", "classid", "1:1", "htb", "rate", "1000mbit", "ceil", "1000mbit").Run()
+	// ifb0: same structure
+	exec.Command("tc", "qdisc", "add", "dev", "ifb0", "root", "handle", "1:0", "htb", "default", "1").Run()
+	exec.Command("tc", "class", "add", "dev", "ifb0", "parent", "1:0", "classid", "1:1", "htb", "rate", "1000mbit", "ceil", "1000mbit").Run()
+	// Ingress for upload mirroring
 	exec.Command("tc", "qdisc", "add", "dev", lanIface, "handle", "ffff:", "ingress").Run()
-	exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "ffff:", "prio", "1",
-		"u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", "ifb0").Run()
+	exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "ffff:", "prio", "2",
+		"protocol", "all", "u32", "match", "u32", "0", "0", "flowid", "1:1", "action", "mirred", "egress", "redirect", "dev", "ifb0").Run()
 }
 
 func nftSetLimit(ip string, ulBps, dlBps int) {
 	tcLazyInit()
-	// Upload: mark via nft, shape via IFB HTB
+	prio := int(hashIp(ip))
+
+	// Upload: nft marks + IFB HTB (dual match: fw + ip src)
 	exec.Command("nft", "delete", "element", "ip", "devman", "ul_mark", "{", ip, "}").Run()
 	if ulBps > 0 { exec.Command("nft", "add", "element", "ip", "devman", "ul_mark", "{", ip, "}").Run() }
-	// IFB class + fw filter
-	ulClass := fmt.Sprintf("1:%x", 0x1000+hashIp(ip))
 	ulKbps := ulBps / 1000
 	if ulKbps < 1 { ulKbps = 1 }
 	if ulBps > 0 {
-		exec.Command("tc", "class", "change", "dev", "ifb0", "parent", "1:", "classid", ulClass,
+		exec.Command("tc", "class", "add", "dev", "ifb0", "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio),
 			"htb", "rate", fmt.Sprintf("%d", ulKbps)+"kbit", "ceil", fmt.Sprintf("%d", ulKbps)+"kbit", "burst", "15k", "cburst", "15k").Run()
-		exec.Command("tc", "class", "add", "dev", "ifb0", "parent", "1:", "classid", ulClass,
+		exec.Command("tc", "class", "change", "dev", "ifb0", "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio),
 			"htb", "rate", fmt.Sprintf("%d", ulKbps)+"kbit", "ceil", fmt.Sprintf("%d", ulKbps)+"kbit", "burst", "15k", "cburst", "15k").Run()
-		exec.Command("tc", "filter", "replace", "dev", "ifb0", "parent", "1:", "prio", "1",
-			"u32", "match", "mark", "0x80000000", "0x80000000", "flowid", ulClass).Run()
+		// eqosplus dual match: fw + u32 ip src on parent 1:0
+		exec.Command("tc", "filter", "add", "dev", "ifb0", "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
+			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "src", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
+		exec.Command("tc", "filter", "replace", "dev", "ifb0", "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
+			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "src", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
 	} else {
-		exec.Command("tc", "class", "del", "dev", "ifb0", "parent", "1:", "classid", ulClass).Run()
+		exec.Command("tc", "filter", "del", "dev", "ifb0", "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
+			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "src", ip).Run()
+		exec.Command("tc", "class", "del", "dev", "ifb0", "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio)).Run()
 	}
-	// Download: mark via nft, shape via HTB egress
+
+	// Download: nft marks + HTB egress on parent 1:0, match ip dst
 	exec.Command("nft", "delete", "element", "ip", "devman", "dl_mark", "{", ip, "}").Run()
 	if dlBps > 0 { exec.Command("nft", "add", "element", "ip", "devman", "dl_mark", "{", ip, "}").Run() }
-	dlClass := fmt.Sprintf("1:%x", 0x2000+hashIp(ip))
 	dlKbps := dlBps / 1000
 	if dlKbps < 1 { dlKbps = 1 }
 	if dlBps > 0 {
-		exec.Command("tc", "class", "change", "dev", lanIface, "parent", "1:", "classid", dlClass,
+		exec.Command("tc", "class", "add", "dev", lanIface, "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio),
 			"htb", "rate", fmt.Sprintf("%d", dlKbps)+"kbit", "ceil", fmt.Sprintf("%d", dlKbps)+"kbit", "burst", "15k", "cburst", "15k").Run()
-		exec.Command("tc", "class", "add", "dev", lanIface, "parent", "1:", "classid", dlClass,
+		exec.Command("tc", "class", "change", "dev", lanIface, "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio),
 			"htb", "rate", fmt.Sprintf("%d", dlKbps)+"kbit", "ceil", fmt.Sprintf("%d", dlKbps)+"kbit", "burst", "15k", "cburst", "15k").Run()
-		exec.Command("tc", "filter", "replace", "dev", lanIface, "parent", "1:", "prio", "1",
-			"u32", "match", "mark", "0x40000000", "0x40000000", "flowid", dlClass).Run()
+		exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
+			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "dst", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
+		exec.Command("tc", "filter", "replace", "dev", lanIface, "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
+			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "dst", ip, "flowid", fmt.Sprintf("1:%d", prio)).Run()
 	} else {
-		exec.Command("tc", "class", "del", "dev", lanIface, "parent", "1:", "classid", dlClass).Run()
+		exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "1:0", "prio", fmt.Sprintf("%d", prio),
+			"handle", fmt.Sprintf("%d", prio), "protocol", "ip", "u32", "match", "ip", "dst", ip).Run()
+		exec.Command("tc", "class", "del", "dev", lanIface, "parent", "1:1", "classid", fmt.Sprintf("1:%d", prio)).Run()
 	}
 }
 
