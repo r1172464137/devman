@@ -29,6 +29,7 @@ type DeviceProfile struct {
 	CurrentMAC string `json:"current_mac"`
 	IsBlocked  bool   `json:"is_blocked"`
 	RateLimit  int    `json:"rate_limit"`
+	RateLimitDn int   `json:"rate_limit_down"`
 	LastSeen   int64  `json:"last_seen"`
 	Online     string `json:"online"`
 	VendorClass string `json:"vendor_class"`
@@ -113,7 +114,7 @@ func initDB() {
 			vendor_class TEXT DEFAULT '', opt55_hash TEXT DEFAULT '',
 			device_type TEXT DEFAULT 'Unknown',
 			alias TEXT DEFAULT '', ipv4 TEXT DEFAULT '',
-			is_blocked INTEGER DEFAULT 0, rate_limit INTEGER DEFAULT 0,
+			is_blocked INTEGER DEFAULT 0, rate_limit INTEGER DEFAULT 0, rate_limit_dn INTEGER DEFAULT 0,
 			last_seen INTEGER DEFAULT 0, first_seen INTEGER DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS device_macs (
@@ -130,6 +131,7 @@ func initDB() {
 			recorded_at INTEGER DEFAULT 0
 		)`,
 		`ALTER TABLE traffic ADD COLUMN speed_in INTEGER DEFAULT 0`,
+		`ALTER TABLE devices ADD COLUMN rate_limit_dn INTEGER DEFAULT 0`,
 	} {
 		db.Exec(q)
 	}
@@ -789,13 +791,13 @@ func reconcileLoop() {
 			unblocked.Close()
 		}
 		// 3. Rate limits
-		rows, _ := db.Query("SELECT id, ipv4, is_blocked, rate_limit FROM devices WHERE ipv4!=''")
+		rows, _ := db.Query("SELECT id, ipv4, is_blocked, COALESCE(rate_limit,0), COALESCE(rate_limit_dn,0) FROM devices WHERE ipv4!=''")
 		if rows != nil {
 			for rows.Next() {
 				var id int64
 				var ip string
-				var b, r int
-				rows.Scan(&id, &ip, &b, &r)
+				var b, r, rd int
+				rows.Scan(&id, &ip, &b, &r, &rd)
 				if r > 0 {
 					exec.Command(scriptDir+"/limit.sh", "set", fmt.Sprintf("%d", id), ip, fmt.Sprintf("%d", r)).Run()
 				} else {
@@ -814,7 +816,7 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 	calcSpeed()
 	mu.RLock()
 	defer mu.RUnlock()
-	rows, _ := db.Query(`SELECT d.id, d.alias, d.hostname, d.device_type, d.ipv4, d.mac, d.vendor_class, d.opt55_hash, d.is_blocked, d.rate_limit, d.last_seen,
+	rows, _ := db.Query(`SELECT d.id, d.alias, d.hostname, d.device_type, d.ipv4, d.mac, d.vendor_class, d.opt55_hash, d.is_blocked, d.rate_limit, COALESCE(d.rate_limit_dn,0), d.last_seen,
 		CASE WHEN d.last_seen > ? THEN 'green' WHEN d.last_seen > ? THEN 'yellow' ELSE 'gray' END,
 		(SELECT COUNT(DISTINCT mac) FROM device_macs WHERE device_id=d.id)
 		FROM devices d ORDER BY d.ipv4 ASC`, time.Now().Unix()-120, time.Now().Unix()-1800)
@@ -828,7 +830,7 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var d DeviceProfile
 		var b int
-		rows.Scan(&d.ID, &d.Alias, &d.Hostname, &d.DeviceType, &d.CurrentIP, &d.CurrentMAC, &d.VendorClass, &d.Opt55Hash, &b, &d.RateLimit, &d.LastSeen, &d.Online, &d.NumMACs)
+		rows.Scan(&d.ID, &d.Alias, &d.Hostname, &d.DeviceType, &d.CurrentIP, &d.CurrentMAC, &d.VendorClass, &d.Opt55Hash, &b, &d.RateLimit, &d.RateLimitDn, &d.LastSeen, &d.Online, &d.NumMACs)
 		if d.DeviceType == "" {
 			d.DeviceType = "Unknown"
 		}
@@ -866,9 +868,10 @@ func apiBlock(w http.ResponseWriter, r *http.Request) {
 
 func apiLimit(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		DeviceID  int64  `json:"device_id"`
-		RateLimit int    `json:"rate_limit"`
-		Alias     string `json:"alias"`
+		DeviceID    int64  `json:"device_id"`
+		RateLimit   int    `json:"rate_limit"`
+		RateLimitDn int    `json:"rate_limit_down"`
+		Alias       string `json:"alias"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 	if req.Alias != "" {
@@ -876,6 +879,9 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RateLimit >= 0 {
 		db.Exec("UPDATE devices SET rate_limit=? WHERE id=?", req.RateLimit, req.DeviceID)
+	}
+	if req.RateLimitDn >= 0 {
+		db.Exec("UPDATE devices SET rate_limit_dn=? WHERE id=?", req.RateLimitDn, req.DeviceID)
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
