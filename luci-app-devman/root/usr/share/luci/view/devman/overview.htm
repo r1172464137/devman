@@ -66,7 +66,7 @@ function vendorIcon(t){
  var m={'Xiaomi':'#ff6900','Samsung':'#3c6cfa','Apple':'#555','Huawei':'#cf0a2c',
   'OnePlus':'#eb0028','Google':'#4285f4','Windows':'#0078d4','Linux':'#f5a623',
   'Android':'#3ddc84','iOS':'#999','IoT':'#888','Mobile':'#888'};
- if(t==='Unknown'||t==='Mobile'||!t)return'<svg width="22" height="22" viewBox="0 0 24 24" fill="#f5a623" stroke="#f5a623" stroke-width="0.5" style="flex-shrink:0"><ellipse cx="12" cy="17" rx="7" ry="5"/><ellipse cx="12" cy="9" rx="5" ry="4" fill="#333"/><circle cx="10" cy="8" r="1.2" fill="#fff"/><circle cx="14" cy="8" r="1.2" fill="#fff"/><path d="M10 12l4-2" stroke="#fff" stroke-width="1" fill="none"/><ellipse cx="12" cy="16" rx="3" ry="2.5" fill="#fff"/></svg>';
+ if(t==='Unknown'||t==='Mobile'||t==='Linux'||!t)return'<span style="font-size:20px;flex-shrink:0">🐧</span>';
  var c=m[t]||'#999',n=t;
  if(n.length>8)n=n.substring(0,7)+'…';
  return '<span style="color:'+c+';font-weight:700;font-size:15px;flex-shrink:0;line-height:1">'+esc(n)+'</span>';
