@@ -98,7 +98,7 @@ func nftSetLimit(ip string, ulBps, dlBps int) {
 	if ulBps > 0 { exec.Command("nft", "add", "element", "ip", "devman", "ul_mark", "{", ip, "}").Run() }
 	// IFB class + fw filter
 	ulClass := fmt.Sprintf("1:%x", 0x1000+hashIp(ip))
-	ulKbps := ulBps / 125 // bps -> kbps
+	ulKbps := ulBps / 1000
 	if ulKbps < 1 { ulKbps = 1 }
 	if ulBps > 0 {
 		exec.Command("tc", "class", "change", "dev", "ifb0", "parent", "1:", "classid", ulClass,
@@ -114,7 +114,7 @@ func nftSetLimit(ip string, ulBps, dlBps int) {
 	exec.Command("nft", "delete", "element", "ip", "devman", "dl_mark", "{", ip, "}").Run()
 	if dlBps > 0 { exec.Command("nft", "add", "element", "ip", "devman", "dl_mark", "{", ip, "}").Run() }
 	dlClass := fmt.Sprintf("1:%x", 0x2000+hashIp(ip))
-	dlKbps := dlBps / 125
+	dlKbps := dlBps / 1000
 	if dlKbps < 1 { dlKbps = 1 }
 	if dlBps > 0 {
 		exec.Command("tc", "class", "change", "dev", lanIface, "parent", "1:", "classid", dlClass,
