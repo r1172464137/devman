@@ -40,15 +40,84 @@ type DeviceProfile struct {
 }
 
 var (
-	db        *sql.DB
-	mu        sync.RWMutex
-	scriptDir = "/usr/lib/devman"
+	db   *sql.DB
+	mu   sync.RWMutex
+	lanIface = "br-lan"
 )
+
+var lanSubnet string
+
+func initLanSubnet() {
+	out, _ := exec.Command("sh", "-c", "ip route show dev "+lanIface+" scope link | awk '{print $1; exit}'").Output()
+	lanSubnet = strings.TrimSpace(string(out))
+	if lanSubnet == "" {
+		lanSubnet = "192.168.5.0/24"
+	}
+	log.Printf("LAN subnet: %s", lanSubnet)
+}
+
+func nftInit() {
+	exec.Command("nft", "add", "table", "ip", "devman").Run()
+	exec.Command("nft", "add", "set", "ip", "devman", "blocked_ip", "{", "type", "ipv4_addr", ";", "}").Run()
+	exec.Command("nft", "add", "chain", "ip", "devman", "forward", "{", "type", "filter", "hook", "forward", "priority", "filter", "-", "1", ";", "}").Run()
+	exec.Command("nft", "add", "rule", "ip", "devman", "forward", "ip", "saddr", "@blocked_ip", "drop").Run()
+}
+
+func nftBlock(ip string)   { exec.Command("nft", "add", "element", "ip", "devman", "blocked_ip", "{", ip, "}").Run() }
+func nftUnblock(ip string) { exec.Command("nft", "delete", "element", "ip", "devman", "blocked_ip", "{", ip, "}").Run() }
+
+func tcInit() {
+	exec.Command("tc", "qdisc", "add", "dev", lanIface, "root", "handle", "1:", "htb", "default", "30").Run()
+	exec.Command("tc", "qdisc", "add", "dev", lanIface, "handle", "ffff:", "ingress").Run()
+}
+
+func tcSetUpload(cid int64, ip string, kbps int) {
+	prio := fmt.Sprintf("%d", cid)
+	wprio := fmt.Sprintf("1%d", cid)
+	// Remove old
+	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "ffff:", "prio", prio).Run()
+	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "ffff:", "prio", wprio).Run()
+	// LAN pass
+	exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "ffff:", "prio", prio,
+		"u32", "match", "ip", "src", ip, "match", "ip", "dst", lanSubnet, "action", "pass").Run()
+	// WAN police
+	exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "ffff:", "prio", wprio,
+		"u32", "match", "ip", "src", ip, "police", "rate", fmt.Sprintf("%d", kbps)+"kbit", "burst", "10k", "drop").Run()
+}
+
+func tcDelUpload(cid int64) {
+	prio := fmt.Sprintf("%d", cid)
+	wprio := fmt.Sprintf("1%d", cid)
+	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "ffff:", "prio", prio).Run()
+	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "ffff:", "prio", wprio).Run()
+}
+
+func tcSetDownload(cid int64, ip string, kbps int) {
+	classid := fmt.Sprintf("1:1%d", cid)
+	exec.Command("tc", "class", "add", "dev", lanIface, "parent", "1:", "classid", classid,
+		"htb", "rate", fmt.Sprintf("%d", kbps)+"kbit", "ceil", fmt.Sprintf("%d", kbps)+"kbit", "burst", "1600", "cburst", "1600").Run()
+	exec.Command("tc", "filter", "replace", "dev", lanIface, "parent", "1:", "prio", "1",
+		"u32", "match", "ip", "dst", ip, "flowid", classid).Run()
+}
+
+func tcDelDownload(cid int64, ip string) {
+	classid := fmt.Sprintf("1:1%d", cid)
+	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "1:", "prio", "1",
+		"u32", "match", "ip", "dst", ip, "flowid", classid).Run()
+	exec.Command("tc", "class", "del", "dev", lanIface, "parent", "1:", "classid", classid).Run()
+}
+
+func tcClean() {
+	exec.Command("tc", "qdisc", "del", "dev", lanIface, "root").Run()
+	exec.Command("tc", "qdisc", "del", "dev", lanIface, "ingress").Run()
+	exec.Command("nft", "delete", "chain", "ip", "devman", "limit_up").Run()
+	exec.Command("nft", "delete", "chain", "ip", "devman", "limit_up_init").Run()
+}
 
 func main() {
 	log.SetFlags(log.LstdFlags)
 	os.MkdirAll("/etc/devman", 0755)
-	os.MkdirAll(scriptDir, 0755)
+	initLanSubnet()
 
 	var err error
 	db, err = sql.Open("sqlite", "/etc/devman/devman.db")
@@ -77,9 +146,9 @@ func main() {
 	// Merge any duplicate hostnames from previous sessions
 	mergeDuplicateHostnames()
 
-	installScripts()
-	initTC()
-	initNFT()
+	nftInit()
+	tcInit()
+	installDnsmasqHook()
 	db.Exec("UPDATE devices SET device_type='Unknown' WHERE device_type='' OR device_type IS NULL")
 	// Immediately fill hostnames from existing leases
 	fillHostnamesFromLeases()
@@ -100,8 +169,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	// cleanup
-	exec.Command(scriptDir+"/block.sh", "init").Run()
-	exec.Command(scriptDir+"/limit.sh", "clean").Run()
+	tcClean()
 }
 
 // ======== init ========
@@ -137,65 +205,15 @@ func initDB() {
 	}
 }
 
-func installScripts() {
-	scripts := map[string]string{
-		"block.sh": `#!/bin/sh
-# nftables set-based blocking
-case "$1" in
-  init)
-    nft add table ip devman 2>/dev/null
-    nft add set ip devman blocked_ip { type ipv4_addr\; } 2>/dev/null
-    nft add chain ip devman forward { type filter hook forward priority filter - 1\; } 2>/dev/null
-    nft add rule ip devman forward ip saddr @blocked_ip drop 2>/dev/null
-    ;;
-  add) nft add element ip devman blocked_ip { $2 } 2>/dev/null ;;
-  del) nft delete element ip devman blocked_ip { $2 } 2>/dev/null ;;
-esac`,
-		"limit.sh": `#!/bin/sh
-# tc htb rate limiting, uses device_id as classid
-CID=$2; IP=$3; RATE=${4:-0}; IF=br-lan
-case "$1" in
-  init) tc qdisc add dev $IF root handle 1: htb default 30 2>/dev/null ;;
-  set)
-    tc filter del dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID 2>/dev/null
-    tc class del dev $IF parent 1: classid 1:$CID 2>/dev/null
-    tc class add dev $IF parent 1: classid 1:$CID htb rate ${RATE}kbit ceil ${RATE}kbit 2>/dev/null
-    tc filter add dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID 2>/dev/null
-    ;;
-  del)
-    tc filter del dev $IF parent 1: prio 1 u32 match ip src $IP flowid 1:$CID 2>/dev/null
-    tc class del dev $IF parent 1: classid 1:$CID 2>/dev/null
-    ;;
-  clean)
-    tc qdisc del dev $IF root 2>/dev/null
-    tc qdisc add dev $IF root handle 1: htb default 30 2>/dev/null
-    ;;
-esac`,
-		"dhcp-hook.sh": `#!/bin/sh
-[ "$1" = "add" ] || [ "$1" = "old" ] || exit 0
-curl -s -X POST http://127.0.0.1:9999/api/dhcp-event -H "Content-Type: application/json" \
-  -d "{\"mac\":\"$2\",\"ip\":\"$3\",\"hostname\":\"${DNSMASQ_SUPPLIED_HOSTNAME:-}\",\"vendor_class\":\"${DNSMASQ_VENDOR_CLASS:-}\",\"opt55\":\"${DNSMASQ_REQUESTED_OPTIONS:-}\"}" &`,
-	}
-	for name, content := range scripts {
-		os.WriteFile(scriptDir+"/"+name, []byte(content), 0755)
-	}
-	// Install dnsmasq hook at default path
+func installDnsmasqHook() {
 	os.WriteFile("/usr/lib/dnsmasq/dhcp-script.sh", []byte(`#!/bin/sh
 [ "$1" = "add" ] || [ "$1" = "old" ] || exit 0
 curl -s -X POST http://127.0.0.1:9999/api/dhcp-event -H "Content-Type: application/json" \
   -d "{\"mac\":\"$2\",\"ip\":\"$3\",\"hostname\":\"${DNSMASQ_SUPPLIED_HOSTNAME:-}\",\"vendor_class\":\"${DNSMASQ_VENDOR_CLASS:-}\",\"opt55\":\"${DNSMASQ_REQUESTED_OPTIONS:-}\"}" &
 `), 0755)
-	// Set via UCI to survive regenerations
 	exec.Command("uci", "set", "dhcp.@dnsmasq[0].dhcpscript=/usr/lib/dnsmasq/dhcp-script.sh").Run()
 	exec.Command("uci", "commit", "dhcp").Run()
 	exec.Command("/etc/init.d/dnsmasq", "restart").Run()
-}
-
-func initTC()  { exec.Command(scriptDir+"/limit.sh", "init").Run() }
-func initNFT() {
-	exec.Command(scriptDir+"/block.sh", "init").Run()
-	// Create traffic counting chain
-	exec.Command("sh", "-c", "nft add table ip devman2 2>/dev/null; nft add chain ip devman2 forward { type filter hook forward priority filter - 2; } 2>/dev/null; nft add set ip devman2 devices { type ipv4_addr; } 2>/dev/null; nft add rule ip devman2 forward ip saddr @devices counter 2>/dev/null; nft add rule ip devman2 forward ip daddr @devices counter 2>/dev/null").Run()
 }
 
 func fillHostnamesFromLeases() {
@@ -781,7 +799,7 @@ func reconcileLoop() {
 			for blocked.Next() {
 				var ip string
 				blocked.Scan(&ip)
-				exec.Command(scriptDir+"/block.sh", "add", ip).Run()
+				nftBlock(ip)
 			}
 			blocked.Close()
 		}
@@ -791,7 +809,7 @@ func reconcileLoop() {
 			for unblocked.Next() {
 				var ip string
 				unblocked.Scan(&ip)
-				exec.Command(scriptDir+"/block.sh", "del", ip).Run()
+				nftUnblock(ip)
 			}
 			unblocked.Close()
 		}
@@ -807,18 +825,18 @@ func reconcileLoop() {
 				if r > 0 {
 					kbps := r / 1000
 					if kbps < 1 { kbps = 1 }
-					exec.Command(scriptDir+"/limit.sh", "set", fmt.Sprintf("%d", id), ip, fmt.Sprintf("%d", kbps)).Run()
+					tcSetUpload(id, ip, kbps)
 				} else {
-					exec.Command(scriptDir+"/limit.sh", "del", fmt.Sprintf("%d", id), ip, "0").Run()
+					tcDelUpload(id)
 				}
 				// Download rate limiting
 				if rd > 0 {
 					log.Printf("RATE_DN: id=%d ip=%s kbps=%.2f", id, ip, float64(rd)/1000)
 					kbps := rd / 1000
 					if kbps < 1 { kbps = 1 }
-					exec.Command(scriptDir+"/limit.sh", "setdn", fmt.Sprintf("%d", id), ip, fmt.Sprintf("%d", kbps)).Run()
+					tcSetDownload(id, ip, kbps)
 				} else {
-					exec.Command(scriptDir+"/limit.sh", "deldn", fmt.Sprintf("%d", id), ip, "0").Run()
+					tcDelDownload(id, ip)
 				}
 			}
 			rows.Close()
@@ -903,9 +921,9 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 			if req.RateLimit > 0 {
 				kbps := req.RateLimit / 1000
 				if kbps < 1 { kbps = 1 }
-				exec.Command(scriptDir+"/limit.sh", "set", fmt.Sprintf("%d", req.DeviceID), ip, fmt.Sprintf("%d", kbps)).Run()
+				tcSetUpload(req.DeviceID, ip, kbps)
 			} else {
-				exec.Command(scriptDir+"/limit.sh", "del", fmt.Sprintf("%d", req.DeviceID), ip, "0").Run()
+				tcDelUpload(req.DeviceID)
 			}
 		}
 	}
@@ -917,9 +935,9 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 			if req.RateLimitDn > 0 {
 				kbps := req.RateLimitDn / 1000
 				if kbps < 1 { kbps = 1 }
-				exec.Command(scriptDir+"/limit.sh", "setdn", fmt.Sprintf("%d", req.DeviceID), ip, fmt.Sprintf("%d", kbps)).Run()
+				tcSetDownload(req.DeviceID, ip, kbps)
 			} else {
-				exec.Command(scriptDir+"/limit.sh", "deldn", fmt.Sprintf("%d", req.DeviceID), ip, "0").Run()
+				tcDelDownload(req.DeviceID, ip)
 			}
 		}
 	}
