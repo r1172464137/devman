@@ -676,10 +676,23 @@ func detectType(hostname, vendorClass string) string {
 			return "Apple"
 		}
 	}
-	for _, kw := range []string{"android", "pixel", "samsung", "sgt-", "oneplus", "redmi", "xiaomi"} {
-		if strings.Contains(h, kw) || strings.Contains(v, kw) {
-			return "Android"
-		}
+	for _, kw := range []string{"xiaomi", "redmi"} {
+		if strings.Contains(h, kw) || strings.Contains(v, kw) { return "Xiaomi" }
+	}
+	for _, kw := range []string{"samsung", "sgt-"} {
+		if strings.Contains(h, kw) || strings.Contains(v, kw) { return "Samsung" }
+	}
+	for _, kw := range []string{"oneplus"} {
+		if strings.Contains(h, kw) || strings.Contains(v, kw) { return "OnePlus" }
+	}
+	for _, kw := range []string{"huawei", "honor"} {
+		if strings.Contains(h, kw) || strings.Contains(v, kw) { return "Huawei" }
+	}
+	for _, kw := range []string{"pixel"} {
+		if strings.Contains(h, kw) || strings.Contains(v, kw) { return "Google" }
+	}
+	for _, kw := range []string{"android"} {
+		if strings.Contains(h, kw) || strings.Contains(v, kw) { return "Android" }
 	}
 	if strings.Contains(h, "desktop") || strings.Contains(h, "compil") || strings.Contains(h, "windows") || strings.Contains(h, "pc-") {
 		return "Windows"
