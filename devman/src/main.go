@@ -35,6 +35,7 @@ type DeviceProfile struct {
 	Online     string `json:"online"`
 	VendorClass string `json:"vendor_class"`
 	Opt55Hash  string `json:"opt55_hash"`
+	Vendor     string `json:"vendor"`
 	SpeedIn    uint64 `json:"speed_in"`
 	SpeedOut   uint64 `json:"speed_out"`
 	NumMACs    int    `json:"num_macs"`
@@ -228,7 +229,7 @@ func initDB() {
 		`CREATE TABLE IF NOT EXISTS devices (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			mac TEXT DEFAULT '', hostname TEXT DEFAULT '',
-			vendor_class TEXT DEFAULT '', opt55_hash TEXT DEFAULT '',
+			vendor_class TEXT DEFAULT '', opt55_hash TEXT DEFAULT '', vendor TEXT DEFAULT '',
 			device_type TEXT DEFAULT 'Unknown',
 			alias TEXT DEFAULT '', ipv4 TEXT DEFAULT '',
 			is_blocked INTEGER DEFAULT 0, rate_limit INTEGER DEFAULT 0, rate_limit_dn INTEGER DEFAULT 0,
@@ -249,6 +250,7 @@ func initDB() {
 		)`,
 		`ALTER TABLE traffic ADD COLUMN speed_in INTEGER DEFAULT 0`,
 		`ALTER TABLE devices ADD COLUMN rate_limit_dn INTEGER DEFAULT 0`,
+		`ALTER TABLE devices ADD COLUMN vendor TEXT DEFAULT ''`,
 	} {
 		db.Exec(q)
 	}
@@ -641,11 +643,11 @@ func detectTypeByMAC(mac string) string {
 		return ""
 	}
 	oui := mac[:6]
-	// Detect randomized/local MAC (bit 1 of first byte = 1 → locally administered)
+	// Randomized/local MAC → check with hostname
 	if len(mac) >= 2 {
 		firstByte, _ := hexToByte(mac[:2])
 		if firstByte&0x2 != 0 {
-			return "Mobile"
+			return ""
 		}
 	}
 	switch oui {

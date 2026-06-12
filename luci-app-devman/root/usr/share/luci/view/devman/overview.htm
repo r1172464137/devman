@@ -11,10 +11,11 @@
 .dm-dot-gray{background:#9ca3af}
 .dm-name{font-weight:600;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dm-type-tag{font-size:10px;padding:2px 8px;border-radius:10px;background:#f0f0f0;color:#666;flex-shrink:0}
-.dm-speeds{display:flex;gap:16px;margin-bottom:10px;font-size:18px;font-weight:700;color:#1a1a1a}
-.dm-speeds span{font-size:11px;font-weight:400;color:#999}
-.dm-speeds .up{color:#2563eb}
-.dm-speeds .dn{color:#16a34a}
+.dm-speeds{display:block;margin-bottom:6px;font-size:20px;font-weight:700;color:#1a1a1a}
+.dm-speeds div{line-height:1.5}
+.dm-up{color:#2563eb}
+.dm-dn{color:#16a34a}
+.dm-detail{margin-bottom:8px;font-size:11px;color:#999}
 .dm-actions{display:flex;gap:6px}
 .dm-act{width:32px;height:32px;border-radius:50%;border:none;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;background:#f5f5f5;transition:all .15s}
 .dm-act:hover{transform:scale(1.1)}
@@ -57,6 +58,11 @@ html[data-darkmode=true] .dm-btn-cancel{background:#444;color:#ccc}
 <script>
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function fmtSpeed(bps){if(!bps||bps>1e12)return'0';if(bps>=1e9)return(bps/1e9).toFixed(2)+' Gbps';if(bps>=1e6)return(bps/1e6).toFixed(1)+' Mbps';if(bps>=1e3)return(bps/1e3).toFixed(0)+' Kbps';return bps+' bps'}
+function vendorIcon(t){
+ var m={'Android':'🤖','iOS':'🍎','Windows':'🪟','Linux':'🐧','macOS':'🍎',
+  'Apple':'🍎','Samsung':'📱','Huawei':'📱','Xiaomi':'📱','IoT':'🔌','Mobile':'📱','Printer':'🖨️','TV':'📺'};
+ return m[t]||'❓';
+}
 function dot(s){
  if(s==='green')return'<div class="dm-dot dm-dot-green" title="Online"></div>';
  if(s==='yellow')return'<div class="dm-dot dm-dot-yellow" title="Maybe offline"></div>';
@@ -74,8 +80,9 @@ function load(){
    if(dev.is_blocked)h+='<div class="dm-blocked-badge">BLOCKED</div>';
    else if(limited)h+='<div class="dm-limited-badge">LIMITED</div>';
    h+='<div class="dm-card-top">'+dot(dev.online)+'<span class="dm-name" title="'+esc(name)+'">'+esc(name)+'</span>';
-   h+='<span class="dm-type-tag">'+esc(dev.device_type)+'</span></div>';
-   h+='<div class="dm-speeds"><span class="up">↑ '+fmtSpeed(dev.speed_in||0)+'</span><span class="dn">↓ '+fmtSpeed(dev.speed_out||0)+'</span></div>';
+   h+='<span class="dm-type-tag" title="'+esc(dev.device_type)+'">'+vendorIcon(dev.device_type)+' '+esc(dev.device_type)+'</span></div>';
+   h+='<div class="dm-speeds"><div class="dm-up">↑ '+fmtSpeed(dev.speed_in||0)+'</div><div class="dm-dn">↓ '+fmtSpeed(dev.speed_out||0)+'</div></div>';
+   h+='<div class="dm-detail">'+esc(dev.current_ip||'')+' · '+esc(dev.current_mac||'')+'</div>';
    h+='<div class="dm-actions">';
    h+=dev.is_blocked
      ?'<button class="dm-act unblock" title="Unblock" onclick="tb('+dev.id+',0)">🔓</button>'
