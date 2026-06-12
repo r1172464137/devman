@@ -39,5 +39,7 @@ case "$1" in
   clean)
     tc qdisc del dev $IF root 2>/dev/null
     tc qdisc del dev $IF ingress 2>/dev/null
+    nft delete chain ip devman limit_up 2>/dev/null
+    nft delete chain ip devman limit_up_init 2>/dev/null
     ;;
 esac
