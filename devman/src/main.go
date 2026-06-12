@@ -115,7 +115,7 @@ func tcSetDownload(cid int64, ip string, kbps int) {
 	exec.Command("tc", "filter", "add", "dev", "ifb0", "parent", "ffff:", "prio", prio,
 		"u32", "match", "ip", "src", lanSubnet, "action", "pass").Run()
 	exec.Command("tc", "filter", "add", "dev", "ifb0", "parent", "ffff:", "prio", wprio,
-		"u32", "police", "rate", fmt.Sprintf("%d", kbps)+"kbit", "burst", "10k", "drop").Run()
+		"u32", "match", "u32", "0", "0", "police", "rate", fmt.Sprintf("%d", kbps)+"kbit", "burst", "10k", "drop").Run()
 }
 
 func tcDelDownload(cid int64, ip string) {
