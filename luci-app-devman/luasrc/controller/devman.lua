@@ -32,13 +32,13 @@ function api_limit()
 	local http = require "luci.http"
 	local dev = http.formvalue("device_id")
 	local limit = http.formvalue("rate_limit") or "0"
+	local limit_dn = http.formvalue("rate_limit_down") or "0"
 	local alias = http.formvalue("alias")
 	if dev then
-		if alias then
-			os.execute('curl -s -X POST http://127.0.0.1:9999/api/limit -d \'{"device_id":'..dev..',"rate_limit":'..limit..',"alias":"'..alias..'"}\' &')
-		else
-			os.execute('curl -s -X POST http://127.0.0.1:9999/api/limit -d \'{"device_id":'..dev..',"rate_limit":'..limit..'}\' &')
-		end
+		local body = '{"device_id":'..dev..',"rate_limit":'..limit..',"rate_limit_down":'..limit_dn
+		if alias then body = body..',"alias":"'..alias..'"' end
+		body = body..'}'
+		os.execute("curl -s -X POST http://127.0.0.1:9999/api/limit -d '"..body.."'")
 	end
 	http.prepare_content("application/json")
 	http.write('{"ok":true}')

@@ -795,6 +795,7 @@ func reconcileLoop() {
 			}
 			unblocked.Close()
 		}
+		log.Printf("RECONCILE: running")
 		// 3. Rate limits
 		rows, _ := db.Query("SELECT id, ipv4, is_blocked, COALESCE(rate_limit,0), COALESCE(rate_limit_dn,0) FROM devices WHERE ipv4!=''")
 		if rows != nil {
@@ -896,9 +897,31 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RateLimit >= 0 {
 		db.Exec("UPDATE devices SET rate_limit=? WHERE id=?", req.RateLimit, req.DeviceID)
+		var ip string
+		db.QueryRow("SELECT ipv4 FROM devices WHERE id=?", req.DeviceID).Scan(&ip)
+		if ip != "" {
+			if req.RateLimit > 0 {
+				kbps := req.RateLimit / 1000
+				if kbps < 1 { kbps = 1 }
+				exec.Command(scriptDir+"/limit.sh", "set", fmt.Sprintf("%d", req.DeviceID), ip, fmt.Sprintf("%d", kbps)).Run()
+			} else {
+				exec.Command(scriptDir+"/limit.sh", "del", fmt.Sprintf("%d", req.DeviceID), ip, "0").Run()
+			}
+		}
 	}
 	if req.RateLimitDn >= 0 {
 		db.Exec("UPDATE devices SET rate_limit_dn=? WHERE id=?", req.RateLimitDn, req.DeviceID)
+		var ip string
+		db.QueryRow("SELECT ipv4 FROM devices WHERE id=?", req.DeviceID).Scan(&ip)
+		if ip != "" {
+			if req.RateLimitDn > 0 {
+				kbps := req.RateLimitDn / 1000
+				if kbps < 1 { kbps = 1 }
+				exec.Command(scriptDir+"/limit.sh", "setdn", fmt.Sprintf("%d", req.DeviceID), ip, fmt.Sprintf("%d", kbps)).Run()
+			} else {
+				exec.Command(scriptDir+"/limit.sh", "deldn", fmt.Sprintf("%d", req.DeviceID), ip, "0").Run()
+			}
+		}
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
