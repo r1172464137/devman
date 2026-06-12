@@ -42,19 +42,7 @@ type DeviceProfile struct {
 var (
 	db   *sql.DB
 	mu   sync.RWMutex
-	lanIface = "br-lan"
 )
-
-var lanSubnet string
-
-func initLanSubnet() {
-	out, _ := exec.Command("sh", "-c", "ip route show dev "+lanIface+" scope link | awk '{print $1; exit}'").Output()
-	lanSubnet = strings.TrimSpace(string(out))
-	if lanSubnet == "" {
-		lanSubnet = "192.168.5.0/24"
-	}
-	log.Printf("LAN subnet: %s", lanSubnet)
-}
 
 func nftInit() {
 	exec.Command("nft", "add", "table", "ip", "devman").Run()
@@ -66,79 +54,44 @@ func nftInit() {
 func nftBlock(ip string)   { exec.Command("nft", "add", "element", "ip", "devman", "blocked_ip", "{", ip, "}").Run() }
 func nftUnblock(ip string) { exec.Command("nft", "delete", "element", "ip", "devman", "blocked_ip", "{", ip, "}").Run() }
 
-func tcInit() {
-	// Ingress on br-lan for upload policing
-	exec.Command("tc", "qdisc", "add", "dev", lanIface, "handle", "ffff:", "ingress").Run()
-	// HTB root for egress filtering (download: LAN pass, WAN → IFB)
-	exec.Command("tc", "qdisc", "add", "dev", lanIface, "root", "handle", "1:", "htb", "default", "30").Run()
-	// IFB for download ingress policing
-	exec.Command("modprobe", "ifb").Run()
-	exec.Command("ip", "link", "add", "dev", "ifb0", "type", "ifb").Run()
-	exec.Command("ip", "link", "set", "dev", "ifb0", "up").Run()
-	exec.Command("tc", "qdisc", "add", "dev", "ifb0", "handle", "ffff:", "ingress").Run()
+func nftSetLimit(ip string, ulBps, dlBps int) {
+	if ulBps >= 0 {
+		out, _ := exec.Command("nft", "-a", "list", "chain", "ip", "devman", "forward").Output()
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.Contains(line, fmt.Sprintf("saddr %s ", ip)) && strings.Contains(line, "limit") {
+				if idx := strings.LastIndex(line, "handle "); idx > 0 {
+					exec.Command("nft", "delete", "rule", "ip", "devman", "forward", "handle", strings.TrimSpace(line[idx+7:])).Run()
+				}
+			}
+		}
+		if ulBps > 0 {
+			exec.Command("nft", "add", "rule", "ip", "devman", "forward",
+				"ip", "saddr", ip, "limit", "rate", fmt.Sprintf("%d", ulBps), "bytes/second", "drop").Run()
+		}
+	}
+	if dlBps >= 0 {
+		out, _ := exec.Command("nft", "-a", "list", "chain", "ip", "devman", "forward").Output()
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.Contains(line, fmt.Sprintf("daddr %s ", ip)) && strings.Contains(line, "limit") {
+				if idx := strings.LastIndex(line, "handle "); idx > 0 {
+					exec.Command("nft", "delete", "rule", "ip", "devman", "forward", "handle", strings.TrimSpace(line[idx+7:])).Run()
+				}
+			}
+		}
+		if dlBps > 0 {
+			exec.Command("nft", "add", "rule", "ip", "devman", "forward",
+				"ip", "daddr", ip, "limit", "rate", fmt.Sprintf("%d", dlBps), "bytes/second", "drop").Run()
+		}
+	}
 }
 
-func tcSetUpload(cid int64, ip string, kbps int) {
-	prio := fmt.Sprintf("%d", cid)
-	wprio := fmt.Sprintf("1%d", cid)
-	// Remove old
-	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "ffff:", "prio", prio).Run()
-	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "ffff:", "prio", wprio).Run()
-	// LAN pass
-	exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "ffff:", "prio", prio,
-		"u32", "match", "ip", "src", ip, "match", "ip", "dst", lanSubnet, "action", "pass").Run()
-	// WAN police
-	exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "ffff:", "prio", wprio,
-		"u32", "match", "ip", "src", ip, "police", "rate", fmt.Sprintf("%d", kbps)+"kbit", "burst", "10k", "drop").Run()
-}
-
-func tcDelUpload(cid int64) {
-	prio := fmt.Sprintf("%d", cid)
-	wprio := fmt.Sprintf("1%d", cid)
-	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "ffff:", "prio", prio).Run()
-	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "ffff:", "prio", wprio).Run()
-}
-
-func tcSetDownload(cid int64, ip string, kbps int) {
-	prio := fmt.Sprintf("%d", cid)
-	wprio := fmt.Sprintf("1%d", cid)
-	// br-lan egress (htb root parent 1:): LAN → pass, WAN → mirred to ifb0
-	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "1:", "prio", prio).Run()
-	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "1:", "prio", wprio).Run()
-	exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "1:", "prio", prio,
-		"u32", "match", "ip", "dst", ip, "match", "ip", "src", lanSubnet, "action", "pass").Run()
-	exec.Command("tc", "filter", "add", "dev", lanIface, "parent", "1:", "prio", wprio,
-		"u32", "match", "ip", "dst", ip, "action", "mirred", "ingress", "redirect", "dev", "ifb0").Run()
-	// ifb0 ingress: police with drop
-	exec.Command("tc", "filter", "del", "dev", "ifb0", "parent", "ffff:", "prio", prio).Run()
-	exec.Command("tc", "filter", "del", "dev", "ifb0", "parent", "ffff:", "prio", wprio).Run()
-	exec.Command("tc", "filter", "add", "dev", "ifb0", "parent", "ffff:", "prio", prio,
-		"u32", "match", "ip", "src", lanSubnet, "action", "pass").Run()
-	exec.Command("tc", "filter", "add", "dev", "ifb0", "parent", "ffff:", "prio", wprio,
-		"u32", "match", "u32", "0", "0", "police", "rate", fmt.Sprintf("%d", kbps)+"kbit", "burst", "10k", "drop").Run()
-}
-
-func tcDelDownload(cid int64, ip string) {
-	prio := fmt.Sprintf("%d", cid)
-	wprio := fmt.Sprintf("1%d", cid)
-	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "1:", "prio", prio).Run()
-	exec.Command("tc", "filter", "del", "dev", lanIface, "parent", "1:", "prio", wprio).Run()
-	exec.Command("tc", "filter", "del", "dev", "ifb0", "parent", "ffff:", "prio", prio).Run()
-	exec.Command("tc", "filter", "del", "dev", "ifb0", "parent", "ffff:", "prio", wprio).Run()
-}
-
-func tcClean() {
-	exec.Command("tc", "qdisc", "del", "dev", lanIface, "root").Run()
-	exec.Command("tc", "qdisc", "del", "dev", lanIface, "ingress").Run()
-	exec.Command("tc", "qdisc", "del", "dev", lanIface, "clsact").Run()
-	exec.Command("tc", "qdisc", "del", "dev", "ifb0", "ingress").Run()
-	exec.Command("ip", "link", "del", "dev", "ifb0").Run()
+func nftCleanup() {
+	exec.Command("nft", "delete", "table", "ip", "devman").Run()
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags)
 	os.MkdirAll("/etc/devman", 0755)
-	initLanSubnet()
 
 	var err error
 	db, err = sql.Open("sqlite", "/etc/devman/devman.db")
@@ -168,7 +121,6 @@ func main() {
 	mergeDuplicateHostnames()
 
 	nftInit()
-	tcInit()
 	installDnsmasqHook()
 	db.Exec("UPDATE devices SET device_type='Unknown' WHERE device_type='' OR device_type IS NULL")
 	// Immediately fill hostnames from existing leases
@@ -190,7 +142,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	// cleanup
-	tcClean()
+	nftCleanup()
 }
 
 // ======== init ========
@@ -843,22 +795,7 @@ func reconcileLoop() {
 				var ip string
 				var b, r, rd int
 				rows.Scan(&id, &ip, &b, &r, &rd)
-				if r > 0 {
-					kbps := r / 1000
-					if kbps < 1 { kbps = 1 }
-					tcSetUpload(id, ip, kbps)
-				} else {
-					tcDelUpload(id)
-				}
-				// Download rate limiting
-				if rd > 0 {
-					log.Printf("RATE_DN: id=%d ip=%s kbps=%.2f", id, ip, float64(rd)/1000)
-					kbps := rd / 1000
-					if kbps < 1 { kbps = 1 }
-					tcSetDownload(id, ip, kbps)
-				} else {
-					tcDelDownload(id, ip)
-				}
+				nftSetLimit(ip, r, rd)
 			}
 			rows.Close()
 		}
@@ -936,31 +873,17 @@ func apiLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RateLimit >= 0 {
 		db.Exec("UPDATE devices SET rate_limit=? WHERE id=?", req.RateLimit, req.DeviceID)
-		var ip string
-		db.QueryRow("SELECT ipv4 FROM devices WHERE id=?", req.DeviceID).Scan(&ip)
-		if ip != "" {
-			if req.RateLimit > 0 {
-				kbps := req.RateLimit / 1000
-				if kbps < 1 { kbps = 1 }
-				tcSetUpload(req.DeviceID, ip, kbps)
-			} else {
-				tcDelUpload(req.DeviceID)
-			}
-		}
 	}
 	if req.RateLimitDn >= 0 {
 		db.Exec("UPDATE devices SET rate_limit_dn=? WHERE id=?", req.RateLimitDn, req.DeviceID)
-		var ip string
-		db.QueryRow("SELECT ipv4 FROM devices WHERE id=?", req.DeviceID).Scan(&ip)
-		if ip != "" {
-			if req.RateLimitDn > 0 {
-				kbps := req.RateLimitDn / 1000
-				if kbps < 1 { kbps = 1 }
-				tcSetDownload(req.DeviceID, ip, kbps)
-			} else {
-				tcDelDownload(req.DeviceID, ip)
-			}
-		}
+	}
+	// Apply immediately via nft
+	var ip string
+	db.QueryRow("SELECT ipv4 FROM devices WHERE id=?", req.DeviceID).Scan(&ip)
+	if ip != "" {
+		var ul, dl int
+		db.QueryRow("SELECT COALESCE(rate_limit,0), COALESCE(rate_limit_dn,0) FROM devices WHERE id=?", req.DeviceID).Scan(&ul, &dl)
+		nftSetLimit(ip, ul, dl)
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
