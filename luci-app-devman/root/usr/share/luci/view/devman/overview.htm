@@ -85,7 +85,7 @@ function load(){
   known.sort(function(a,b){ return (a.current_ip||'').localeCompare(b.current_ip||''); });
   unknown.sort(function(a,b){ return (a.current_ip||'').localeCompare(b.current_ip||''); });
   var h='<div class="dm-grid">';
-  function renderCard(dev){
+  var renderCard=function(dev){
    var name=dev.alias||dev.hostname||'未知设备';
    var limited=(dev.rate_limit||dev.rate_limit_down);
    h+='<div class="dm-card">';
@@ -102,10 +102,10 @@ function load(){
    h+='<button class="dm-act limit" title="Limit" onclick="sl('+dev.id+','+(dev.rate_limit||0)+','+(dev.rate_limit_down||0)+')">⚡</button>';
    h+='<button class="dm-act rename" title="Rename" onclick="rn('+dev.id+',\''+esc(name)+'\')">✎</button>';
    h+='</div></div>';
-  }
+  };
   known.forEach(renderCard);
   if(unknown.length){
-   h+='</div><div class="dm-unknown-toggle" onclick="var g=document.getElementById(\'dm-unknown\');var a=this.querySelector(\'span\');g.style.display=g.style.display==\'none\'?\'grid\':\'none\';a.textContent=a.textContent==\'▶\'?\'▼\':\'▶\'">未知设备 ('+unknown.length+') <span>▶</span></div><div class="dm-grid" id="dm-unknown" style="display:none">';
+   h+='</div><div class="dm-unknown-toggle" onclick="toggleUnknown(this)">🐧 未知设备 ('+unknown.length+') <span>▶</span></div><div class="dm-grid" id="dm-unknown" style="display:none">';
    unknown.forEach(renderCard);
   }
   h+='</div>';
@@ -145,6 +145,11 @@ function rn(id,n){
  m.querySelector('#dm-rn').onkeydown=function(e){if(e.key==='Enter')m.querySelector('.dm-btn-save').click()};
 }
 function sl(id,curUp,curDn){showLimitModal(id,curUp,curDn)}
+function toggleUnknown(el){
+ var g=document.getElementById('dm-unknown');
+ if(g.style.display=='none'){g.style.display='grid';el.querySelector('span').textContent='▼'}
+ else{g.style.display='none';el.querySelector('span').textContent='▶'}
+}
 load();setInterval(load,5000);
 document.querySelector('h2').textContent='Device Manager v6.7';
 </script>
