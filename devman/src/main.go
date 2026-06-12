@@ -67,8 +67,8 @@ func nftBlock(ip string)   { exec.Command("nft", "add", "element", "ip", "devman
 func nftUnblock(ip string) { exec.Command("nft", "delete", "element", "ip", "devman", "blocked_ip", "{", ip, "}").Run() }
 
 func tcInit() {
-	exec.Command("tc", "qdisc", "add", "dev", lanIface, "root", "handle", "1:", "htb", "default", "30").Run()
 	exec.Command("tc", "qdisc", "add", "dev", lanIface, "handle", "ffff:", "ingress").Run()
+	exec.Command("tc", "qdisc", "add", "dev", lanIface, "root", "handle", "1:", "htb", "default", "30").Run()
 }
 
 func tcSetUpload(cid int64, ip string, kbps int) {
@@ -94,8 +94,13 @@ func tcDelUpload(cid int64) {
 
 func tcSetDownload(cid int64, ip string, kbps int) {
 	classid := fmt.Sprintf("1:1%d", cid)
-	exec.Command("tc", "class", "add", "dev", lanIface, "parent", "1:", "classid", classid,
+	exec.Command("tc", "class", "change", "dev", lanIface, "parent", "1:", "classid", classid,
 		"htb", "rate", fmt.Sprintf("%d", kbps)+"kbit", "ceil", fmt.Sprintf("%d", kbps)+"kbit", "burst", "1600", "cburst", "1600").Run()
+	if err := exec.Command("tc", "class", "change", "dev", lanIface, "parent", "1:", "classid", classid,
+		"htb", "rate", fmt.Sprintf("%d", kbps)+"kbit", "ceil", fmt.Sprintf("%d", kbps)+"kbit", "burst", "1600", "cburst", "1600").Run(); err != nil {
+		exec.Command("tc", "class", "add", "dev", lanIface, "parent", "1:", "classid", classid,
+			"htb", "rate", fmt.Sprintf("%d", kbps)+"kbit", "ceil", fmt.Sprintf("%d", kbps)+"kbit", "burst", "1600", "cburst", "1600").Run()
+	}
 	exec.Command("tc", "filter", "replace", "dev", lanIface, "parent", "1:", "prio", "1",
 		"u32", "match", "ip", "dst", ip, "flowid", classid).Run()
 }
@@ -110,8 +115,6 @@ func tcDelDownload(cid int64, ip string) {
 func tcClean() {
 	exec.Command("tc", "qdisc", "del", "dev", lanIface, "root").Run()
 	exec.Command("tc", "qdisc", "del", "dev", lanIface, "ingress").Run()
-	exec.Command("nft", "delete", "chain", "ip", "devman", "limit_up").Run()
-	exec.Command("nft", "delete", "chain", "ip", "devman", "limit_up_init").Run()
 }
 
 func main() {
