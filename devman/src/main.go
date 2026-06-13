@@ -141,14 +141,26 @@ curl -s -X POST http://127.0.0.1:9999/api/dhcp-event -H "Content-Type: applicati
 }
 
 func fillHostnamesFromLeases() {
+	// dhcp.leases
 	out, _ := os.ReadFile("/etc/dhcp.leases")
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 4 {
 			ip := fields[2]
 			hostname := fields[3]
-			if hostname != "" && hostname != "*" {
+			if hostname != "" && hostname != "*" && isLAN(ip) {
 				upsertDevice(ip, "", hostname, "", "")
+			}
+		}
+	}
+	// dnsmasq hosts table (/tmp/hosts)
+	out, _ = os.ReadFile("/tmp/hosts")
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && isLAN(fields[0]) {
+			hostname := fields[1]
+			if hostname != "" && !strings.HasPrefix(hostname, "#") {
+				upsertDevice(fields[0], "", hostname, "", "")
 			}
 		}
 	}
