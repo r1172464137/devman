@@ -92,7 +92,7 @@ func mdnsLoop() {
 func neightLoop() {
 	log.Printf("NEIGH: started")
 	for {
-		out, _ := exec.Command("/usr/sbin/ip", "neigh", "show").Output()
+		out, _ := exec.Command("/sbin/ip", "neigh", "show").Output()
 		for _, line := range strings.Split(string(out), "\n") {
 			fields := strings.Fields(line)
 			if len(fields) < 5 {
