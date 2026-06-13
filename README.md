@@ -52,9 +52,21 @@ make package/new/luci-app-devman/compile V=s
 
 ## 依赖
 
-- Linux 6.x + nftables
-- tc（HTB / u32 / mirred / police 动作）
-- eBPF（DHCP 嗅探）
+| 类型 | 包名 | 用途 |
+|------|------|------|
+| 内核模块 | `kmod-ifb` | IFB 虚拟网卡，上路限速 |
+| 内核模块 | `kmod-sched-core` | HTB 队列 + fw 过滤器 |
+| 内核模块 | `kmod-sched-act-police` | ingress police 丢包动作 |
+| 内核模块 | `kmod-sched-act-mirred` | mirred 流量重定向 |
+| 用户空间 | `tc-tiny` 或 `tc-full` | tc 命令行工具 |
+| 用户空间 | `nftables` (firewall4) | 封禁 + mark |
+| 内核 | eBPF (CONFIG_DEBUG_INFO_BTF) | DHCP 嗅探（可选，回退 AF_PACKET） |
+| 数据库 | `libsqlite3` | 设备持久化 |
+
+## 编译依赖
+
+- Go 1.21+
+- OpenWrt SDK / Buildroot
 
 ## 许可
 
