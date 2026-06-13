@@ -291,6 +291,11 @@ func updateDev(id int64, ip, mac, hostname, vendorClass, fpHash, devType string,
 	}
 	if mac != "" {
 		db.Exec("INSERT OR IGNORE INTO device_macs (device_id,mac) VALUES (?,?)", id, mac)
+		db.Exec("UPDATE devices SET mac=? WHERE id=?", mac, id)
+		// Re-detect device type from MAC OUI
+		if dt := detectTypeByMAC(mac); dt != "" && dt != "Unknown" {
+			db.Exec("UPDATE devices SET device_type=? WHERE id=? AND (device_type='Unknown' OR device_type='')", dt, id)
+		}
 	}
 	// If IP changed from one known IP to another and the old IP was recorded as a different device, merge
 	if currentIP != "" && currentIP != "0.0.0.0" && currentIP != ip && ip != "" {
