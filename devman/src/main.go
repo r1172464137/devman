@@ -137,7 +137,7 @@ curl -s -X POST http://127.0.0.1:9999/api/dhcp-event -H "Content-Type: applicati
 `), 0755)
 	exec.Command("uci", "set", "dhcp.@dnsmasq[0].dhcpscript=/usr/lib/dnsmasq/dhcp-script.sh").Run()
 	exec.Command("uci", "commit", "dhcp").Run()
-	exec.Command("/etc/init.d/dnsmasq", "restart").Run()
+	exec.Command("/etc/init.d/dnsmasq", "reload").Run()
 }
 
 func fillHostnamesFromLeases() {
