@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -19,26 +20,52 @@ func htons(v uint16) uint16 { b := make([]byte, 2); binary.BigEndian.PutUint16(b
 // ====== discovery ======
 
 func mdnsLoop() {
-	// Periodically scan mDNS for hostnames
 	for {
-		out, _ := exec.Command("sh", "-c", "timeout 5 tcpdump -i br-lan -nn -A port 5353 -c 50 2>/dev/null || true").Output()
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.Contains(line, "A ") || !strings.Contains(line, ".local") {
-				continue
+		// Pure Go mDNS listener on multicast
+		addr, err := net.ResolveUDPAddr("udp", "224.0.0.251:5353")
+		if err != nil {
+			time.Sleep(60 * time.Second)
+			continue
+		}
+		conn, err := net.ListenMulticastUDP("udp", nil, addr)
+		if err != nil {
+			time.Sleep(60 * time.Second)
+			continue
+		}
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 2048)
+		for {
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				break
 			}
-			// Parse mDNS A record answers: hostname.local → IP
-			parts := strings.Fields(line)
-			for i, p := range parts {
-				if strings.HasSuffix(p, ".local.") && i+2 < len(parts) {
-					hostname := strings.TrimSuffix(p, ".local.")
-					hostname = strings.TrimSuffix(hostname, ".")
-					ipPart := parts[i+2]
-					if isIPv4(ipPart) && strings.HasPrefix(ipPart, "192.168") {
-						upsertDevice(ipPart, "", hostname, "", "")
+			if n < 12 || buf[2]&0x80 != 0x80 {
+				continue
+			} // Only DNS responses (QR=1)
+			data := string(buf[:n])
+			// Extract hostname and IP from mDNS response
+			for _, line := range strings.Split(data, "\n") {
+				if !strings.Contains(line, ".local") {
+					continue
+				}
+				parts := strings.Fields(line)
+				for i, p := range parts {
+					if strings.HasSuffix(p, ".local") && i+1 < len(parts) {
+						hostname := strings.TrimSuffix(p, ".local")
+						hostname = strings.TrimSuffix(hostname, ".")
+						if len(hostname) > 0 {
+							// Find IP in the response
+							for j := 0; j < len(parts); j++ {
+								if isIPv4(parts[j]) && strings.HasPrefix(parts[j], "192.168") {
+									upsertDevice(parts[j], "", hostname, "", "")
+								}
+							}
+						}
 					}
 				}
 			}
 		}
+		conn.Close()
 		time.Sleep(60 * time.Second)
 	}
 }
