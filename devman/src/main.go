@@ -62,6 +62,7 @@ func main() {
 	fillHostnamesFromLeases()
 
 	go neightLoop()
+	go mdnsLoop()
 	go conntrackLoop()
 	go leaseLoop()
 	go dhcpSniffLoop()

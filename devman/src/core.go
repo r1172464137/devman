@@ -18,6 +18,31 @@ func htons(v uint16) uint16 { b := make([]byte, 2); binary.BigEndian.PutUint16(b
 
 // ====== discovery ======
 
+func mdnsLoop() {
+	// Periodically scan mDNS for hostnames
+	for {
+		out, _ := exec.Command("sh", "-c", "timeout 5 tcpdump -i br-lan -nn -A port 5353 -c 50 2>/dev/null || true").Output()
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.Contains(line, "A ") || !strings.Contains(line, ".local") {
+				continue
+			}
+			// Parse mDNS A record answers: hostname.local → IP
+			parts := strings.Fields(line)
+			for i, p := range parts {
+				if strings.HasSuffix(p, ".local.") && i+2 < len(parts) {
+					hostname := strings.TrimSuffix(p, ".local.")
+					hostname = strings.TrimSuffix(hostname, ".")
+					ipPart := parts[i+2]
+					if isIPv4(ipPart) && strings.HasPrefix(ipPart, "192.168") {
+						upsertDevice(ipPart, "", hostname, "", "")
+					}
+				}
+			}
+		}
+		time.Sleep(60 * time.Second)
+	}
+}
+
 func neightLoop() {
 	log.Printf("NEIGH: started")
 	firstRun := true
