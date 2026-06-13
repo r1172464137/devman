@@ -156,10 +156,19 @@ func isLAN(ip string) bool {
 	return strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "10.") || strings.HasPrefix(ip, "172.16.")
 }
 
+func isIPv4(ip string) bool {
+	for _, c := range ip {
+		if (c < '0' || c > '9') && c != '.' { return false }
+	}
+	return strings.Count(ip, ".") == 3
+}
+
 // ====== DB ops ======
 
 func upsertDevice(ip, mac, hostname, vendorClass, opt55 string) int64 {
 	now := time.Now().Unix()
+	// Ignore IPv6 addresses
+	if ip != "" && strings.Contains(ip, ":") { ip = "" }
 	fpHash := ""
 	if vendorClass != "" && opt55 != "" {
 		fpHash = fmt.Sprintf("%x", sha256.Sum256([]byte(vendorClass+opt55)))[:8]
