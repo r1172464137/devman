@@ -134,14 +134,6 @@ func conntrackLoop() {
 	}
 }
 
-func leaseLoop() {
-	log.Printf("LEASE: started")
-	for {
-		fillHostnamesFromLeases()
-		time.Sleep(30 * time.Second)
-	}
-}
-
 func dhcpSniffLoop() {
 	log.Printf("DHCP_RAW: starting AF_PACKET raw socket...")
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_ALL)))
@@ -237,18 +229,9 @@ func upsertDevice(ip, mac, hostname, vendorClass, opt55 string) int64 {
 	if ip != "" && strings.Contains(ip, ":") { ip = "" }
 	// Must have at least one identifiable attribute
 	if ip == "" && hostname == "" && mac == "" { return 0 }
-	// Must have IP or MAC to create a device
-	if ip == "" && mac == "" { return 0 }
 	fpHash := ""
 	if vendorClass != "" && opt55 != "" {
 		fpHash = fmt.Sprintf("%x", sha256.Sum256([]byte(vendorClass+opt55)))[:8]
-	}
-	if ip == "" && hostname == "" && mac == "" {
-		return 0
-	}
-	// Try to fill hostname from leases if we have an IP
-	if hostname == "" && ip != "" {
-		hostname = searchHostnameByIP(ip)
 	}
 	devType := detectType(hostname, vendorClass)
 	if devType == "Unknown" && mac != "" {

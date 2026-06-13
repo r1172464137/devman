@@ -60,13 +60,9 @@ func main() {
 	restoreRateLimits()
 	installDnsmasqHook()
 	db.Exec("UPDATE devices SET device_type='Unknown' WHERE device_type='' OR device_type IS NULL")
-	// Immediately fill hostnames from existing leases
-	fillHostnamesFromLeases()
 
 	go neightLoop()
-	go mdnsLoop()
 	go conntrackLoop()
-	go leaseLoop()
 	go resolveHostnamesLoop()
 	go dhcpSniffLoop()
 	go reconcileLoop()
@@ -143,14 +139,6 @@ curl -s -X POST http://127.0.0.1:9999/api/dhcp-event -H "Content-Type: applicati
 	exec.Command("/etc/init.d/dnsmasq", "reload").Run()
 }
 
-func getLeaseFile() string {
-	out, err := exec.Command("uci", "get", "dhcp.@dnsmasq[0].leasefile").Output()
-	if err == nil && len(out) > 1 {
-		return strings.TrimSpace(string(out))
-	}
-	return "/etc/dhcp.leases"
-}
-
 func netbiosQuery(ip string) string {
 	// NetBIOS Node Status query on UDP 137
 	conn, err := net.DialTimeout("udp", ip+":137", 2*time.Second)
@@ -218,72 +206,6 @@ func resolveHostnamesLoop() {
 		}
 		time.Sleep(15 * time.Second)
 	}
-}
-
-func fillHostnamesFromLeases() {
-	leaseFile := getLeaseFile()
-	out, _ := os.ReadFile(leaseFile)
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 {
-			ip := fields[2]
-			hostname := fields[3]
-			if hostname != "" && hostname != "*" && isLAN(ip) {
-				upsertDevice(ip, "", hostname, "", "")
-				// Persist hostname in DB so it survives lease wipe
-				db.Exec("UPDATE devices SET hostname=? WHERE ipv4=? AND hostname=''", hostname, ip)
-			}
-		}
-	}
-	// dnsmasq hosts table (/tmp/hosts)
-	out, _ = os.ReadFile("/tmp/hosts")
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && isLAN(fields[0]) {
-			hostname := fields[1]
-			if hostname != "" && !strings.HasPrefix(hostname, "#") {
-				upsertDevice(fields[0], "", hostname, "", "")
-				db.Exec("UPDATE devices SET hostname=? WHERE ipv4=? AND hostname=''", hostname, fields[0])
-			}
-		}
-	}
-	// Restore persisted hostnames from DB for devices that lost them
-	db.Exec("UPDATE devices SET hostname=(SELECT hostname FROM devices d2 WHERE d2.mac=devices.mac AND d2.hostname!='' ORDER BY d2.last_seen DESC LIMIT 1) WHERE hostname=''")
-	// Active reverse DNS via dnsmasq
-	rows, _ := db.Query("SELECT DISTINCT ipv4 FROM devices WHERE hostname='' AND ipv4!=''")
-	if rows != nil {
-		defer rows.Close()
-		for rows.Next() {
-			var ip string
-			rows.Scan(&ip)
-			out, err := exec.Command("nslookup", ip).Output()
-			if err == nil {
-				for _, line := range strings.Split(string(out), "\n") {
-					if strings.Contains(line, "name =") {
-						hn := strings.TrimSpace(strings.Split(line, "name =")[1])
-						hn = strings.TrimSuffix(hn, ".")
-						if len(hn) > 0 && hn != "localhost" {
-							upsertDevice(ip, "", hn, "", "")
-							db.Exec("UPDATE devices SET hostname=? WHERE ipv4=? AND hostname=''", hn, ip)
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-func searchHostnameByIP(ip string) string {
-	out, _ := os.ReadFile("/etc/dhcp.leases")
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[2] == ip {
-			if hn := fields[3]; hn != "*" {
-				return hn
-			}
-		}
-	}
-	return ""
 }
 
 func hexToByte(s string) (byte, error) {
